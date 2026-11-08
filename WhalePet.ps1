@@ -16,6 +16,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Net.Http
 Add-Type -AssemblyName System.Security
+Add-Type -AssemblyName System.Speech
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -42,6 +44,8 @@ function Initialize-DataDir {
 $script:DataDir = Initialize-DataDir
 $script:ConfigPath = Join-Path $script:DataDir 'config.json'
 $script:LogPath = Join-Path $script:DataDir 'whale-pet.log'
+$script:WorkspaceDir = Join-Path $script:DataDir 'workspace'
+if (-not (Test-Path $script:WorkspaceDir)) { New-Item -ItemType Directory -Path $script:WorkspaceDir -Force | Out-Null }
 
 function Write-Log([string]$Message) {
   try {
@@ -91,6 +95,7 @@ function New-DefaultConfig {
     autoStart       = $true
     lowBalanceThreshold = 5
     lastBalanceLow  = $false
+    ttsEnabled      = $false
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
   }
@@ -147,6 +152,15 @@ if (-not ('WhalePetWin32' -as [type])) {
 [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 '@
 }
+
+if (-not ('PetWin32' -as [type])) {
+  Add-Type -Namespace '' -Name 'PetWin32' -MemberDefinition @'
+public class RECT { public int Left; public int Top; public int Right; public int Bottom; }
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+'@
+}
+
 
 function Set-ToolWindowStyle($Window) {
   try {
@@ -817,6 +831,8 @@ $script:MissedPending = @()
 $script:BalanceWarned = $false
 $script:LastBalanceWarnAt = $null
 $script:BalanceWasLow = [bool]$script:Config.lastBalanceLow
+$script:PendingContext = ''
+$script:Synth = $null
 $script:GifFrames = @()
 $script:GifIndex = 0
 $script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1075,6 +1091,129 @@ function New-ApiRequest([string]$Method, [string]$Url, [string]$Key, [string]$Js
 }
 
 # ============================================================================
+#  读屏（Windows OCR，本地） / 工作区 / 语音
+# ============================================================================
+function Get-ForegroundRect {
+  try {
+    $h = [PetWin32]::GetForegroundWindow()
+    $ptr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(16)
+    try {
+      if ([PetWin32]::GetWindowRect($h, $ptr)) {
+        $left = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr, 0)
+        $top = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr, 4)
+        $right = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr, 8)
+        $bottom = [System.Runtime.InteropServices.Marshal]::ReadInt32($ptr, 12)
+        $w = $right - $left
+        $ht = $bottom - $top
+        if ($w -gt 80 -and $ht -gt 80) {
+          return @{ X = $left; Y = $top; Width = $w; Height = $ht }
+        }
+      }
+    } finally {
+      [System.Runtime.InteropServices.Marshal]::FreeHGlobal($ptr)
+    }
+  } catch { }
+  $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  return @{ X = $b.X; Y = $b.Y; Width = $b.Width; Height = $b.Height }
+}
+
+function Invoke-LookAtScreen {
+  Write-Log '读屏: 触发'
+  try {
+    $r = Get-ForegroundRect
+    Write-Log ('读屏: 区域 ' + $r.Width + 'x' + $r.Height)
+    $tmpDir = Join-Path $script:DataDir 'tmp'
+    if (-not (Test-Path $tmpDir)) { New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null }
+    $png = Join-Path $tmpDir 'look.png'
+    $outTxt = Join-Path $tmpDir 'look.txt'
+    Remove-Item $outTxt -Force -ErrorAction SilentlyContinue
+    $bmp = New-Object System.Drawing.Bitmap ($r.Width), ($r.Height)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($r.X, $r.Y, 0, 0, $bmp.Size)
+    $g.Dispose()
+    $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    Write-Log '读屏: 截图完成'
+
+    $helper = Join-Path $script:AppDir 'tools\ocr.ps1'
+    if (-not (Test-Path $helper)) { throw '缺少 tools\ocr.ps1' }
+    Write-Log '读屏: 调用 OCR helper'
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-ImagePath', $png, '-OutPath', $outTxt) -WindowStyle Hidden -Wait | Out-Null
+    Write-Log '读屏: helper 返回'
+    if (-not (Test-Path $outTxt)) { throw 'OCR 没有返回结果' }
+    $text = [System.IO.File]::ReadAllText($outTxt, [System.Text.Encoding]::UTF8)
+    Remove-Item $png, $outTxt -Force -ErrorAction SilentlyContinue
+
+    if ([string]::IsNullOrWhiteSpace($text)) {
+      Write-Log '读屏: 无文字'
+      Show-Bubble '没看清屏幕上有什么' '可以换一个窗口再试'
+      return
+    }
+    $script:PendingContext = $text
+    $flat = ($text -replace '\s+', ' ').Trim()
+    if ($flat.Length -gt 54) { $flat = $flat.Substring(0, 54) + '…' }
+    Show-Bubble ('看到啦：' + $flat) '已记住这一屏，接着跟我说想做什么'
+    if ($script:ChatWindow.IsVisible) {
+      Add-ChatBubble ('【屏幕】' + $text.Substring(0, [Math]::Min(400, $text.Length))) 'system' | Out-Null
+    }
+    Write-Log ('读屏: ' + $text.Length + ' 字')
+  } catch {
+    Write-Log ('读屏失败: ' + $_.Exception.Message)
+    Show-Bubble '读屏失败' ($_.Exception.Message)
+  }
+}
+
+function Resolve-WorkspacePath([string]$Path) {
+  $root = [System.IO.Path]::GetFullPath($script:WorkspaceDir).TrimEnd('\')
+  if ([string]::IsNullOrWhiteSpace($Path)) { return $root }
+  if ([System.IO.Path]::IsPathRooted($Path)) {
+    $full = [System.IO.Path]::GetFullPath($Path)
+  } else {
+    $full = [System.IO.Path]::GetFullPath((Join-Path $root $Path))
+  }
+  if (-not ($full.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase))) {
+    throw '只能访问工作区里的文件'
+  }
+  return $full
+}
+
+function Initialize-Tts {
+  try {
+    $script:Synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
+    $script:Synth.Rate = 0
+    $script:Synth.Volume = 100
+    $voices = @($script:Synth.GetInstalledVoices() | Where-Object { $_.Enabled })
+    $zh = $voices | Where-Object { $_.VoiceInfo.Culture.Name -like 'zh*' } | Select-Object -First 1
+    $picked = '默认语音'
+    if ($zh) {
+      try {
+        $script:Synth.SelectVoice($zh.VoiceInfo.Name)
+        $picked = $zh.VoiceInfo.Name
+      } catch {
+        Write-Log ('TTS 选择中文语音失败，改用默认: ' + $_.Exception.Message)
+      }
+    }
+    Write-Log ('TTS 就绪: ' + $picked)
+  } catch {
+    $script:Synth = $null
+    Write-Log ('TTS 初始化失败: ' + $_.Exception.Message)
+  }
+}
+
+function Speak-Reply([string]$Text) {
+  if (-not $script:Config.ttsEnabled) { return }
+  if (-not $script:Synth) { return }
+  try {
+    $clean = ($Text -replace '[*_#>`~]', '') -replace '\s+', ' '
+    $clean = $clean.Trim()
+    if ($clean.Length -gt 300) { $clean = $clean.Substring(0, 300) }
+    if (-not $clean) { return }
+    $script:Synth.SpeakAsyncCancelAll()
+    $script:Synth.SpeakAsync($clean) | Out-Null
+  } catch { Write-Log ('TTS 失败: ' + $_.Exception.Message) }
+}
+
+# ============================================================================
 #  余额
 # ============================================================================
 function Notify-BalanceLow([string]$Detail = '', [switch]$Force) {
@@ -1203,6 +1342,30 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
         foreach ($h in $hits) { $items += @{ kind = $h.kind; text = $h.text } }
         return (@{ ok = $true; hits = $items } | ConvertTo-Json -Depth 5 -Compress)
       }
+      'read_file' {
+        $path = Resolve-WorkspacePath ([string]$a['path'])
+        if (-not (Test-Path -LiteralPath $path)) {
+          return (@{ ok = $false; reason = '文件不存在'; path = $path } | ConvertTo-Json -Compress)
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        if ($bytes -contains 0) {
+          return (@{ ok = $false; reason = '二进制文件不支持' } | ConvertTo-Json -Compress)
+        }
+        $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        if ($text.Length -gt 8000) { $text = $text.Substring(0, 8000) + '…（已截断）' }
+        return (@{ ok = $true; path = $path; content = $text } | ConvertTo-Json -Compress)
+      }
+      'list_dir' {
+        $path = Resolve-WorkspacePath ([string]$a['path'])
+        if (-not (Test-Path -LiteralPath $path)) {
+          return (@{ ok = $false; reason = '目录不存在' } | ConvertTo-Json -Compress)
+        }
+        $items = @()
+        foreach ($i in (Get-ChildItem -LiteralPath $path -ErrorAction SilentlyContinue | Select-Object -First 100)) {
+          $items += @{ name = $i.Name; type = $(if ($i.PSIsContainer) { 'dir' } else { 'file' }); size = $i.Length }
+        }
+        return (@{ ok = $true; path = $path; items = $items } | ConvertTo-Json -Depth 5 -Compress)
+      }
       'get_current_time' {
         return (@{ ok = $true; now = (Get-Date).ToString('yyyy-MM-dd HH:mm dddd') } | ConvertTo-Json -Compress)
       }
@@ -1302,6 +1465,7 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   if ([string]::IsNullOrWhiteSpace($reply)) { $reply = '（这次没想出话来说…）' }
   Remove-ChatPlaceholder
   Add-ChatBubble $reply 'assistant' | Out-Null
+  Speak-Reply $reply
   Set-ChatBusy $false
   $script:ChatCtx = $null
 
@@ -1354,6 +1518,10 @@ function Send-ChatMessage {
 
   $messages = @()
   $messages += @{ role = 'system'; content = (Get-SystemPrompt (Get-MemoryDigest)) }
+  if ($script:PendingContext) {
+    $messages += @{ role = 'system'; content = ('用户刚让你看了一眼屏幕，OCR 内容（可能不完整）：' + $script:PendingContext) }
+    $script:PendingContext = ''
+  }
   foreach ($t in @(Get-RecentTurns 14)) {
     $messages += @{ role = $t.role; content = $t.content }
   }
@@ -1761,11 +1929,19 @@ $miAuto = New-MenuItem '开机自启' {
 } $true ([bool]$script:Config.autoStart)
 $miSettings = New-MenuItem '设置…' { Show-Settings }
 $miSkin = New-MenuItem '换皮肤…' { Show-SkinPanel }
+$miLook = New-MenuItem '看看这个（读屏）' { Invoke-LookAtScreen }
+$miTts = New-MenuItem '朗读回复' {
+  $script:Config.ttsEnabled = [bool]$miTts.IsChecked
+  Save-Config
+  if ($miTts.IsChecked) { Speak-Reply '好的，我会把回复读出来' }
+} $true ([bool]$script:Config.ttsEnabled)
+$miWorkspace = New-MenuItem '打开工作区' { Start-Process explorer.exe $script:WorkspaceDir }
 $miRestart = New-MenuItem '重启桌宠' { Restart-App }
 $miFolder = New-MenuItem '打开数据文件夹' { Start-Process explorer.exe $script:DataDir }
 $miExit = New-MenuItem '退出' { Exit-App }
 
 $menu.Items.Add($miChat) | Out-Null
+$menu.Items.Add($miLook) | Out-Null
 $menu.Items.Add($miMemory) | Out-Null
 $menu.Items.Add($miTodos) | Out-Null
 $menu.Items.Add($miReflect) | Out-Null
@@ -1776,6 +1952,8 @@ $menu.Items.Add($miAuto) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $menu.Items.Add($miSettings) | Out-Null
 $menu.Items.Add($miSkin) | Out-Null
+$menu.Items.Add($miTts) | Out-Null
+$menu.Items.Add($miWorkspace) | Out-Null
 $menu.Items.Add($miRestart) | Out-Null
 $menu.Items.Add($miFolder) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
@@ -2126,6 +2304,7 @@ $script:MainWindow.Add_Loaded({
   Write-Log 'Loaded: begin'
   Save-Config
   Apply-Skin (Get-ActiveSkinId)
+  Initialize-Tts
   Start-IdleAnimations
   Initialize-Tray
   $script:BalanceTimer.Start()
@@ -2159,6 +2338,7 @@ $script:MainWindow.Add_Loaded({
 
   if ($env:WHALEPET_OPEN_MEMORY -eq '1') { Show-MemoryPanel }
   if ($env:WHALEPET_OPEN_SKINS -eq '1') { Show-SkinPanel }
+  if ($env:WHALEPET_LOOK_TEST -eq '1') { Invoke-LookAtScreen }
   if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
     $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)

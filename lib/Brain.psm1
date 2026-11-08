@@ -87,6 +87,34 @@ function Get-ToolDefinitions {
     @{
       type     = 'function'
       function = @{
+        name        = 'read_file'
+        description = '读取工作区里的一个文本文件（相对路径或工作区内的绝对路径），返回前 8000 个字符。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            path = @{ type = 'string'; description = '文件路径，相对于工作区或工作区内绝对路径' }
+          }
+          required   = @('path')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
+        name        = 'list_dir'
+        description = '列出工作区里某个目录的文件和子目录。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            path = @{ type = 'string'; description = '目录路径，留空表示工作区根目录' }
+          }
+          required   = @()
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
         name        = 'get_current_time'
         description = '获取当前日期和时间。'
         parameters  = @{ type = 'object'; properties = @{}; required = @() }
