@@ -96,6 +96,7 @@ function New-DefaultConfig {
     lowBalanceThreshold = 5
     lastBalanceLow  = $false
     ttsEnabled      = $false
+    dshRoot         = ''
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
   }
@@ -696,6 +697,97 @@ $xamlSkin = @'
 '@
 
 # ============================================================================
+#  XAML — 交给 DSH
+# ============================================================================
+$xamlDsh = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="交给 DSH" Width="540" Height="380"
+        WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" FontFamily="Microsoft YaHei UI">
+  <Window.Resources>
+    <Style x:Key="PrimaryBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#2F7CF6" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#1E6BE6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="GhostBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#5B6B7F"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#EEF3FA" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#E3EBF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Border CornerRadius="20" Background="#FFFDFB" BorderBrush="#E6EDF7"
+          BorderThickness="1" Margin="12">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="30" ShadowDepth="5" Opacity="0.24" Color="#12203A"/>
+    </Border.Effect>
+    <Grid Margin="22,18,22,16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <StackPanel Grid.Row="0">
+        <TextBlock Text="交给 DSH 处理" FontSize="17" FontWeight="SemiBold" Foreground="#17202B"/>
+        <TextBlock Text="文件、终端、代码、调研类任务交给 DSH；闲聊和关心还是直接跟小鲸鱼说。"
+                   FontSize="11.5" Foreground="#8A97A8" Margin="0,6,0,0" TextWrapping="Wrap"/>
+      </StackPanel>
+
+      <TextBox x:Name="DshInput" Grid.Row="1" Margin="0,12,0,0" AcceptsReturn="True"
+               TextWrapping="Wrap" VerticalScrollBarVisibility="Auto" FontSize="13"
+               Background="#F8FAFD" BorderBrush="#E3EBF5" BorderThickness="1" Padding="10"
+               Foreground="#17202B"/>
+
+      <Grid Grid.Row="2" Margin="0,12,0,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="DshStatus" FontSize="11" Foreground="#8A97A8" VerticalAlignment="Center"
+                   Text="结果会显示在聊天窗口里"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <Button x:Name="DshCancel" Content="取消" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+          <Button x:Name="DshSend" Content="交给 DSH" Style="{StaticResource PrimaryBtn}"/>
+        </StackPanel>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+# ============================================================================
 #  XAML — 设置窗口
 # ============================================================================
 $xamlSettings = @'
@@ -833,6 +925,7 @@ $script:LastBalanceWarnAt = $null
 $script:BalanceWasLow = [bool]$script:Config.lastBalanceLow
 $script:PendingContext = ''
 $script:Synth = $null
+$script:DshRun = $null
 $script:GifFrames = @()
 $script:GifIndex = 0
 $script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1211,6 +1304,147 @@ function Speak-Reply([string]$Text) {
     $script:Synth.SpeakAsyncCancelAll()
     $script:Synth.SpeakAsync($clean) | Out-Null
   } catch { Write-Log ('TTS 失败: ' + $_.Exception.Message) }
+}
+
+# ============================================================================
+#  交给 DSH（headless 桥）
+# ============================================================================
+function Get-DshPaths {
+  $root = [string]$script:Config.dshRoot
+  if ([string]::IsNullOrWhiteSpace($root)) { $root = 'D:\Program Files (x86)\dsh' }
+  $exe = Join-Path $root 'DeepSeek Harness.exe'
+  $cliJs = Join-Path $root 'resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js'
+  return @{ exe = $exe; cliJs = $cliJs; ok = (Test-Path $exe) }
+}
+
+function Start-DshTask([string]$Task) {
+  $Task = ($Task -replace "`r?`n", ' ').Trim()
+  if ([string]::IsNullOrWhiteSpace($Task)) { return }
+  if ($script:DshRun) { Show-Bubble 'DSH 还在忙' '等这次跑完再发'; return }
+
+  $paths = Get-DshPaths
+  if (-not $paths.ok) {
+    Show-Bubble '找不到 DSH' '检查安装路径，或改 config.json 里的 dshRoot'
+    return
+  }
+  $key = Get-ApiKey
+  if ([string]::IsNullOrWhiteSpace($key)) {
+    Show-Bubble '需要先配置 API Key' '右键 →「设置」'
+    return
+  }
+
+  $clean = $Task -replace '"', "'"
+  $tmp = Join-Path $script:DataDir 'tmp'
+  if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
+  $stamp = (Get-Date).ToString('HHmmssfff')
+  $outFile = Join-Path $tmp ("dsh-$stamp.out")
+  $errFile = Join-Path $tmp ("dsh-$stamp.err")
+
+  $oldNode = $env:ELECTRON_RUN_AS_NODE
+  $oldKey = $env:DEEPSEEK_API_KEY
+  $env:ELECTRON_RUN_AS_NODE = '1'
+  $env:DEEPSEEK_API_KEY = $key
+  try {
+    $proc = Start-Process -FilePath $paths.exe `
+      -ArgumentList @('--expose-internals', ('"' + $paths.cliJs + '"'), 'headless', ('"' + $clean + '"')) `
+      -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
+      -WindowStyle Hidden -WorkingDirectory $script:WorkspaceDir -PassThru
+  } catch {
+    Show-Bubble 'DSH 启动失败' ($_.Exception.Message)
+    return
+  } finally {
+    $env:ELECTRON_RUN_AS_NODE = $oldNode
+    $env:DEEPSEEK_API_KEY = $oldKey
+  }
+
+  $script:DshRun = @{
+    proc    = $proc
+    out     = $outFile
+    err     = $errFile
+    task    = $Task
+    started = (Get-Date)
+    timeout = 240
+  }
+  Show-Bubble '交给 DSH 了…' '这类任务可能要十几秒'
+  $script:DshTimer.Start()
+}
+
+$script:DshTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:DshTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+$script:DshTimer.Add_Tick({
+  if (-not $script:DshRun) { $script:DshTimer.Stop(); return }
+  $run = $script:DshRun
+
+  if (-not $run.proc.HasExited) {
+    if (((Get-Date) - $run.started).TotalSeconds -gt $run.timeout) {
+      try { $run.proc.Kill() } catch { }
+      $script:DshRun = $null
+      $script:DshTimer.Stop()
+      Show-Bubble 'DSH 超时了' '任务可能太大，拆小一点再试'
+    }
+    return
+  }
+
+  $script:DshTimer.Stop()
+  Start-Sleep -Milliseconds 120
+  $stdout = ''
+  $stderr = ''
+  try { if (Test-Path $run.out) { $stdout = [System.IO.File]::ReadAllText($run.out, [System.Text.Encoding]::UTF8) } } catch { }
+  try { if (Test-Path $run.err) { $stderr = [System.IO.File]::ReadAllText($run.err, [System.Text.Encoding]::UTF8) } } catch { }
+  Remove-Item $run.out, $run.err -Force -ErrorAction SilentlyContinue
+  $elapsed = [int]((Get-Date) - $run.started).TotalSeconds
+  $code = $null
+  try {
+    $run.proc.Refresh()
+    $code = $run.proc.ExitCode
+  } catch { }
+  $task = $run.task
+  $script:DshRun = $null
+  $ok = ($code -eq 0) -or (($null -eq $code -or "$code" -eq '') -and -not [string]::IsNullOrWhiteSpace($stdout))
+
+  Show-Chat
+  Add-ChatBubble ('【交给 DSH】' + $task) 'system' | Out-Null
+  if ($ok -and -not [string]::IsNullOrWhiteSpace($stdout)) {
+    $reply = $stdout.Trim()
+    if ($reply.Length -gt 3000) { $reply = $reply.Substring(0, 3000) + '…' }
+    Add-ChatBubble $reply 'assistant' | Out-Null
+    Speak-Reply $reply
+    Show-Bubble 'DSH 回来啦' ('用时 ' + $elapsed + ' 秒')
+  } else {
+    $msg = $stderr.Trim()
+    if (-not $msg) { $msg = '没有输出（退出码 ' + $code + '）' }
+    if ($msg.Length -gt 800) { $msg = $msg.Substring(0, 800) + '…' }
+    Add-ChatBubble ('DSH 失败：' + $msg) 'system' | Out-Null
+    Show-Bubble 'DSH 没跑成功' '详情在聊天窗口'
+  }
+  $codeText = if ($null -eq $code -or "$code" -eq '') { 'n/a' } else { $code }
+  Write-Log ('DSH 完成: code=' + $codeText + ' ' + $elapsed + 's')
+})
+
+function Show-DshDialog {
+  $dlg = New-WindowFromXaml $xamlDsh
+  $dlg.Topmost = $true
+  if ($script:MainWindow.IsVisible) { $dlg.Owner = $script:MainWindow }
+  $input = $dlg.FindName('DshInput')
+  $send = $dlg.FindName('DshSend')
+  $cancel = $dlg.FindName('DshCancel')
+  $status = $dlg.FindName('DshStatus')
+  $script:DshDialog = $dlg
+  $script:DshInputBox = $input
+  $script:DshStatusText = $status
+
+  $cancel.Add_Click({ $script:DshDialog.Close() })
+  $send.Add_Click({
+    $text = $script:DshInputBox.Text
+    if ([string]::IsNullOrWhiteSpace($text)) { $script:DshStatusText.Text = '先写点要它做的事'; return }
+    $script:DshDialog.Close()
+    Start-DshTask $text
+  })
+  $dlg.Add_KeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'Escape') { $script:DshDialog.Close() }
+  })
+  $dlg.ShowDialog() | Out-Null
 }
 
 # ============================================================================
@@ -1930,6 +2164,7 @@ $miAuto = New-MenuItem '开机自启' {
 $miSettings = New-MenuItem '设置…' { Show-Settings }
 $miSkin = New-MenuItem '换皮肤…' { Show-SkinPanel }
 $miLook = New-MenuItem '看看这个（读屏）' { Invoke-LookAtScreen }
+$miDsh = New-MenuItem '交给 DSH 处理…' { Show-DshDialog }
 $miTts = New-MenuItem '朗读回复' {
   $script:Config.ttsEnabled = [bool]$miTts.IsChecked
   Save-Config
@@ -1942,6 +2177,7 @@ $miExit = New-MenuItem '退出' { Exit-App }
 
 $menu.Items.Add($miChat) | Out-Null
 $menu.Items.Add($miLook) | Out-Null
+$menu.Items.Add($miDsh) | Out-Null
 $menu.Items.Add($miMemory) | Out-Null
 $menu.Items.Add($miTodos) | Out-Null
 $menu.Items.Add($miReflect) | Out-Null
@@ -2339,6 +2575,7 @@ $script:MainWindow.Add_Loaded({
   if ($env:WHALEPET_OPEN_MEMORY -eq '1') { Show-MemoryPanel }
   if ($env:WHALEPET_OPEN_SKINS -eq '1') { Show-SkinPanel }
   if ($env:WHALEPET_LOOK_TEST -eq '1') { Invoke-LookAtScreen }
+  if ($env:WHALEPET_DSH_TEST) { Start-DshTask $env:WHALEPET_DSH_TEST }
   if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
     $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)
