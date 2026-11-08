@@ -26,7 +26,7 @@ def write_result(path, payload):
         json.dump(payload, f, ensure_ascii=False)
 
 
-def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=800):
+def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=1800):
     import sounddevice as sd
 
     rate = 16000
@@ -118,6 +118,7 @@ def main():
     ap.add_argument('--model', default='small')
     ap.add_argument('--model-dir', default=DEFAULT_MODEL_DIR)
     ap.add_argument('--device', default='cpu')
+    ap.add_argument('--silence-ms', type=int, default=1800)
     args = ap.parse_args()
 
     tmp_wav = args.wav
@@ -125,7 +126,7 @@ def main():
     try:
         if not tmp_wav:
             tmp_wav = os.path.join(os.path.dirname(args.out), 'utterance.wav')
-            seconds = record_utterance(tmp_wav, args.wait, args.max)
+            seconds = record_utterance(tmp_wav, args.wait, args.max, args.silence_ms)
             created = True
             if seconds <= 0:
                 write_result(args.out, {'ok': True, 'text': '', 'seconds': 0, 'reason': 'no_speech'})

@@ -99,6 +99,7 @@ function New-DefaultConfig {
     voiceAutoSend   = $false
     voiceWakeEnabled = $false
     voiceWakeWord   = '小鲸鱼'
+    voiceSilenceMs  = 1800
     dshRoot         = ''
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
@@ -1022,6 +1023,8 @@ $script:VoiceTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:VoiceTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $script:VoiceTimer.Add_Tick({ Update-VoiceInput })
 $script:ConversationActive = $false
+$script:VoiceBuffer = ''
+$script:VoiceExtend = 0
 $script:WakeProc = $null
 $script:WakeMarker = ''
 $script:WakeTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1482,9 +1485,11 @@ function Start-VoiceInput {
   $out = Join-Path $tmp 'voice.json'
   Remove-Item $out -Force -ErrorAction SilentlyContinue
 
+  $sil = [int]$script:Config.voiceSilenceMs
+  if ($sil -lt 400) { $sil = 1800 }
   $maxSec = if ($Conversation) { 60 } else { 60 }
   $waitSec = if ($Conversation) { 30 } else { 20 }
-  $args = @((Join-Path $script:AppDir 'voice\utterance.py'), '--out', $out, '--max', "$maxSec", '--wait', "$waitSec", '--model', $model, '--device', 'cpu')
+  $args = @((Join-Path $script:AppDir 'voice\utterance.py'), '--out', $out, '--max', "$maxSec", '--wait', "$waitSec", '--model', $model, '--device', 'cpu', '--silence-ms', [string]$sil)
   if ($env:WHALEPET_VOICE_WAV) { $args += @('--wav', $env:WHALEPET_VOICE_WAV) }
 
   try {
@@ -1566,6 +1571,18 @@ function Update-VoiceInput {
   }
 
   if ($script:ConversationActive) {
+    $needMore = ($text.Length -lt 4) -or ($text -match '(的|和|跟|然后|所以|因为|就是|那个|这个|但是|而且|还有|我想|我要|帮我|给我|把|对|在|从|如果|虽然|或者|以及|的话)[，,。！？!?]?$')
+    if ($needMore -and $script:VoiceExtend -lt 3 -and ($script:VoiceBuffer.Length + $text.Length) -lt 80) {
+      $script:VoiceBuffer = ($script:VoiceBuffer + ' ' + $text).Trim()
+      $script:VoiceExtend++
+      Write-Log ('语音续听: ' + $text)
+      Show-Bubble '我听着呢…' '你继续说'
+      Start-VoiceInput -Conversation
+      return
+    }
+    if ($script:VoiceBuffer) { $text = ($script:VoiceBuffer + ' ' + $text).Trim() }
+    $script:VoiceBuffer = ''
+    $script:VoiceExtend = 0
     Write-Log ('语音识别: ' + $text)
     $script:ChatInput.Text = $text
     Send-ChatMessage
@@ -1600,6 +1617,8 @@ function Start-Conversation {
 function End-Conversation([string]$Why = '') {
   if (-not $script:ConversationActive) { return }
   $script:ConversationActive = $false
+$script:VoiceBuffer = ''
+$script:VoiceExtend = 0
   if ($script:Synth) { try { $script:Synth.SpeakAsyncCancelAll() } catch { } }
   Show-Bubble '先聊到这' $(if ($Why) { $Why } else { '叫我就行' })
   if ($script:Config.voiceWakeEnabled) { Start-WakeListener }
