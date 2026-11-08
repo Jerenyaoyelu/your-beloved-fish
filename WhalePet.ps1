@@ -1,9 +1,10 @@
 ﻿# ============================================================================
-#  小鲸鱼桌宠 (Whale Pet) — 独立运行的 Windows 桌面挂件
+#  小鲸鱼桌宠 (Whale Pet) v0.2
 #  · 始终置顶、透明无边框、可拖拽、点击冒泡、双击聊天
-#  · 聊天走 DeepSeek API（OpenAI 兼容 /chat/completions）
-#  · 用 PowerShell 5.1 + WPF 实现，不需要安装任何东西
-#  启动：双击 启动小鲸鱼.vbs（无控制台窗口）
+#  · 本地记忆：事实 / 待办 / 提醒 / 摘要 / 逐轮对话（关机不丢）
+#  · 工作助手：工具调用（记待办、设提醒、长期记忆、查记忆、查时间）
+#  · 自我进化：自动抽取记忆 + 每日整理，更新 persona.md
+#  启动：双击 启动小鲸鱼.vbs
 # ============================================================================
 $ErrorActionPreference = 'Stop'
 
@@ -18,7 +19,6 @@ Add-Type -AssemblyName System.Security
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ---------------------------------------------------------------- 路径 & 日志
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:WhalePng = Join-Path $script:AppDir 'assets\whale.png'
 
@@ -53,19 +53,26 @@ function Write-Log([string]$Message) {
   } catch { }
 }
 
-Write-Log ("=== 启动，数据目录: " + $script:DataDir + " ===")
+Write-Log ("=== 启动 v0.2，数据目录: " + $script:DataDir + " ===")
 
 trap {
-  $logFile = 'C:\Users\ASUS\Documents\deepseek-harness\default-workspace\whale-pet\data\fatal.log'
+  $logFile = if ($script:DataDir) { Join-Path $script:DataDir 'fatal.log' } else { Join-Path $env:TEMP 'whale-pet-fatal.log' }
   try { [System.IO.File]::AppendAllText($logFile, ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + "  FATAL: " + $_.Exception.ToString() + "`r`n")) } catch { }
   try { [System.Windows.MessageBox]::Show(($_.Exception.Message + "`n`n详细信息见 `n" + $logFile), '小鲸鱼启动失败') | Out-Null } catch { }
   exit 1
 }
 
+# ---------------------------------------------------------------- 模块
+Import-Module (Join-Path $script:AppDir 'lib\Store.psm1') -Force
+Import-Module (Join-Path $script:AppDir 'lib\Brain.psm1') -Force
+
+$script:FreshMemory = -not (Test-Path (Join-Path $script:DataDir 'memory.json'))
+Initialize-Store -DataDir $script:DataDir
+
 # ---------------------------------------------------------------- 单实例
 $script:Mutex = New-Object System.Threading.Mutex($false, 'Local\DeepSeekWhalePet')
 try {
-  if (-not $script:Mutex.WaitOne(0)) {
+  if (-not $script:Mutex.WaitOne(5000)) {
     Write-Log '已有实例在运行，退出。'
     exit 0
   }
@@ -186,7 +193,7 @@ function Set-Autostart([bool]$On) {
 }
 
 # ============================================================================
-#  XAML — 主窗口（透明置顶的小鲸鱼）
+#  XAML — 主窗口
 # ============================================================================
 $xamlMain = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -257,7 +264,7 @@ $xamlMain = @'
 $xamlChat = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="和小鲸鱼聊天" Width="404" Height="566"
+        Title="和小鲸鱼聊天" Width="430" Height="620"
         WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
         Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
         WindowStartupLocation="Manual" FontFamily="Microsoft YaHei UI">
@@ -328,6 +335,8 @@ $xamlChat = @'
           <TextBlock x:Name="ChatBalance" Text="" FontSize="11" Foreground="#7A8798"
                      Margin="10,2,0,0" VerticalAlignment="Center"/>
         </StackPanel>
+        <Button x:Name="ChatMemory" Content="记忆" Style="{StaticResource IconBtn}"
+                Width="46" Height="30" HorizontalAlignment="Right" Margin="0,0,48,0"/>
         <Button x:Name="ChatClose" Content="✕" Style="{StaticResource IconBtn}"
                 Width="30" Height="30" HorizontalAlignment="Right" Margin="0,0,12,0"/>
       </Grid>
@@ -355,6 +364,140 @@ $xamlChat = @'
         </Border>
         <Button x:Name="ChatSend" Grid.Column="1" Content="发送"
                 Style="{StaticResource PrimaryBtn}" Margin="8,0,0,0" VerticalAlignment="Bottom"/>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+# ============================================================================
+#  XAML — 记忆与设定
+# ============================================================================
+$xamlMemory = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="记忆与设定" Width="640" Height="820"
+        WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" FontFamily="Microsoft YaHei UI">
+  <Window.Resources>
+    <Style x:Key="PrimaryBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#2F7CF6" CornerRadius="10" Padding="16,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#1E6BE6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="GhostBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#5B6B7F"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#EEF3FA" CornerRadius="10" Padding="16,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#E3EBF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="XBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#A9B4C2"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Width" Value="24"/>
+      <Setter Property="Height" Value="24"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Background="Transparent" CornerRadius="6">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Border CornerRadius="20" Background="#FFFDFB" BorderBrush="#E6EDF7"
+          BorderThickness="1" Margin="12">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="30" ShadowDepth="5" Opacity="0.24" Color="#12203A"/>
+    </Border.Effect>
+    <Grid Margin="22,18,22,16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <StackPanel Grid.Row="0" Orientation="Horizontal">
+        <TextBlock Text="记忆与设定" FontSize="17" FontWeight="SemiBold" Foreground="#17202B"/>
+        <TextBlock x:Name="MemStats" Margin="12,4,0,0" FontSize="11" Foreground="#8A97A8"/>
+      </StackPanel>
+
+      <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,10,0,0">
+        <StackPanel x:Name="MemBody">
+          <TextBlock Text="关于你" FontSize="12" FontWeight="SemiBold" Foreground="#7A8798" Margin="0,4,0,4"/>
+          <StackPanel x:Name="FactsPanel"/>
+
+          <TextBlock Text="待办" FontSize="12" FontWeight="SemiBold" Foreground="#7A8798" Margin="0,16,0,4"/>
+          <StackPanel x:Name="TodoPanel"/>
+          <Grid Margin="0,6,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <Border Background="#F3F7FC" CornerRadius="10" BorderBrush="#E3EBF5" BorderThickness="1" Padding="8,2">
+              <TextBox x:Name="MemTodoInput" Background="Transparent" BorderThickness="0" FontSize="12.5"
+                       MinHeight="28" VerticalContentAlignment="Center" Foreground="#17202B"/>
+            </Border>
+            <Button x:Name="MemTodoAdd" Grid.Column="1" Content="添加" Style="{StaticResource GhostBtn}"
+                    Margin="8,0,0,0" Padding="14,6"/>
+          </Grid>
+
+          <TextBlock Text="最近摘要" FontSize="12" FontWeight="SemiBold" Foreground="#7A8798" Margin="0,18,0,4"/>
+          <TextBlock x:Name="SummariesText" TextWrapping="Wrap" FontSize="12" Foreground="#5B6B7F" LineHeight="18"/>
+
+          <TextBlock Text="人设（可编辑，小鲸鱼会自己补充“我学到的”）" FontSize="12" FontWeight="SemiBold"
+                     Foreground="#7A8798" Margin="0,18,0,4"/>
+          <TextBox x:Name="PersonaBox" Height="200" AcceptsReturn="True" TextWrapping="Wrap"
+                   VerticalScrollBarVisibility="Auto" FontSize="12" Foreground="#1B2430"
+                   Background="#F8FAFD" BorderBrush="#E3EBF5" BorderThickness="1" Padding="8"/>
+        </StackPanel>
+      </ScrollViewer>
+
+      <Grid Grid.Row="2" Margin="0,12,0,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="MemStatus" FontSize="11" Foreground="#8A97A8" VerticalAlignment="Center"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <Button x:Name="MemReflect" Content="整理记忆" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+          <Button x:Name="MemSavePersona" Content="保存人设" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+          <Button x:Name="MemClose" Content="关闭" Style="{StaticResource PrimaryBtn}"/>
+        </StackPanel>
       </Grid>
     </Grid>
   </Border>
@@ -446,7 +589,6 @@ $xamlSettings = @'
       <TextBlock Grid.Row="0" Text="小鲸鱼设置" FontSize="17" FontWeight="SemiBold" Foreground="#17202B"/>
 
       <TextBlock Grid.Row="1" Text="DeepSeek API Key" FontSize="12" Foreground="#7A8798" Margin="0,16,0,6"/>
-
       <PasswordBox x:Name="KeyBox" Grid.Row="2" Height="38" FontSize="13" Padding="10,7"
                    Background="#F4F7FC" BorderBrush="#DCE6F2" BorderThickness="1"/>
 
@@ -457,7 +599,6 @@ $xamlSettings = @'
       </StackPanel>
 
       <TextBlock Grid.Row="4" Text="模型" FontSize="12" Foreground="#7A8798" Margin="0,14,0,6"/>
-
       <TextBox x:Name="ModelBox" Grid.Row="5" Height="36" FontSize="13" Padding="10,6"
                Background="#F4F7FC" BorderBrush="#DCE6F2" BorderThickness="1"/>
 
@@ -481,7 +622,6 @@ function New-WindowFromXaml([string]$Xaml) {
 #  状态
 # ============================================================================
 $script:Config = Load-Config
-$script:FirstRun = -not (Test-Path $script:ConfigPath)
 $script:BalanceText = ''
 $script:BalanceOk = $false
 $script:BalanceBusy = $false
@@ -490,11 +630,14 @@ $script:ChatHistory = @()
 $script:ChatBusy = $false
 $script:ChatPlaceholderBubble = $null
 $script:ChatVisible = $false
+$script:ChatCtx = $null
+$script:Extracting = $false
+$script:Reflecting = $false
+$script:MemBuilding = $false
 $script:IdleLines = @(
   '在呢在呢～', '摸摸头～', '今天也辛苦啦', '要不要聊两句？',
   '点我干嘛呀，嘿嘿', '我一直在这儿哦', '喝口水休息一下嘛', '嘿！'
 )
-$script:SystemPrompt = '你是住在用户 Windows 桌面上的小鲸鱼桌宠，名字叫“小鲸鱼”。你说话简短、可爱、有点黏人，用中文回答，一般一到三句话，不要用 Markdown 排版，不要长篇大论。'
 
 # ============================================================================
 #  主窗口
@@ -530,9 +673,7 @@ if ($null -ne $script:Config.posX -and $null -ne $script:Config.posY) {
 }
 Clamp-Window $script:MainWindow
 
-$script:MainWindow.Add_SourceInitialized({
-  Set-ToolWindowStyle $script:MainWindow
-})
+$script:MainWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:MainWindow })
 
 # ---------------------------------------------------------------- 聊天窗口
 $script:ChatWindow = New-WindowFromXaml $xamlChat
@@ -544,11 +685,25 @@ $script:ChatInput = $script:ChatWindow.FindName('ChatInput')
 $script:ChatPlaceholder = $script:ChatWindow.FindName('ChatPlaceholder')
 $script:ChatSend = $script:ChatWindow.FindName('ChatSend')
 $script:ChatClose = $script:ChatWindow.FindName('ChatClose')
+$script:ChatMemory = $script:ChatWindow.FindName('ChatMemory')
 $script:ChatBalance = $script:ChatWindow.FindName('ChatBalance')
+$script:ChatWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:ChatWindow })
 
-$script:ChatWindow.Add_SourceInitialized({
-  Set-ToolWindowStyle $script:ChatWindow
-})
+# ---------------------------------------------------------------- 记忆窗口
+$script:MemWindow = New-WindowFromXaml $xamlMemory
+$script:MemStats = $script:MemWindow.FindName('MemStats')
+$script:MemBody = $script:MemWindow.FindName('MemBody')
+$script:FactsPanel = $script:MemWindow.FindName('FactsPanel')
+$script:TodoPanel = $script:MemWindow.FindName('TodoPanel')
+$script:SummariesText = $script:MemWindow.FindName('SummariesText')
+$script:PersonaBox = $script:MemWindow.FindName('PersonaBox')
+$script:MemStatus = $script:MemWindow.FindName('MemStatus')
+$script:MemTodoInput = $script:MemWindow.FindName('MemTodoInput')
+$script:MemTodoAdd = $script:MemWindow.FindName('MemTodoAdd')
+$script:MemReflect = $script:MemWindow.FindName('MemReflect')
+$script:MemSavePersona = $script:MemWindow.FindName('MemSavePersona')
+$script:MemClose = $script:MemWindow.FindName('MemClose')
+$script:MemWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:MemWindow })
 
 # ============================================================================
 #  冒泡
@@ -606,7 +761,7 @@ function Add-ChatBubble {
   $b.CornerRadius = [System.Windows.CornerRadius]::new(12)
   $b.Padding = [System.Windows.Thickness]::new(11, 7, 11, 7)
   $b.Margin = [System.Windows.Thickness]::new(4, 3, 4, 3)
-  $b.MaxWidth = 300
+  $b.MaxWidth = 320
   $tb = New-Object System.Windows.Controls.TextBlock
   $tb.Text = $Text
   $tb.TextWrapping = 'Wrap'
@@ -657,8 +812,15 @@ function Update-ChatBalance {
   }
 }
 
+function Remove-ChatPlaceholder {
+  if ($script:ChatPlaceholderBubble) {
+    $script:ChatPanel.Children.Remove($script:ChatPlaceholderBubble) | Out-Null
+    $script:ChatPlaceholderBubble = $null
+  }
+}
+
 # ============================================================================
-#  HTTP（HttpClient + DispatcherTimer，避免后台线程跑脚本）
+#  HTTP
 # ============================================================================
 $script:Http = New-Object System.Net.Http.HttpClient
 $script:Http.Timeout = [TimeSpan]::FromSeconds(120)
@@ -737,8 +899,6 @@ function Refresh-Balance {
     } elseif ($status -eq 401) {
       $script:BalanceText = 'Key 无效'
       $script:BalanceOk = $false
-    } else {
-      $script:BalanceOk = $false
     }
     Update-ChatBalance
   }
@@ -749,7 +909,63 @@ $script:BalanceTimer.Interval = [TimeSpan]::FromSeconds(90)
 $script:BalanceTimer.Add_Tick({ Refresh-Balance })
 
 # ============================================================================
-#  聊天发送
+#  工具执行
+# ============================================================================
+function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
+  $a = @{}
+  if ($ArgsJson) {
+    try {
+      $o = $ArgsJson | ConvertFrom-Json
+      foreach ($p in $o.PSObject.Properties) { $a[$p.Name] = $p.Value }
+    } catch { }
+  }
+  try {
+    switch ($Name) {
+      'add_todo' {
+        $todo = Add-Todo -Text ([string]$a['text']) -Due ([string]$a['due'])
+        return (@{ ok = $true; todo = $todo.text; due = $todo.due } | ConvertTo-Json -Compress)
+      }
+      'complete_todo' {
+        $t = Complete-Todo -Text ([string]$a['text'])
+        if ($t) { return (@{ ok = $true; done = $t.text } | ConvertTo-Json -Compress) }
+        return (@{ ok = $false; reason = '没找到这条待办' } | ConvertTo-Json -Compress)
+      }
+      'list_todos' {
+        $items = @()
+        foreach ($t in (Get-OpenTodos)) { $items += @{ text = $t.text; due = $t.due } }
+        return (@{ ok = $true; todos = $items; count = $items.Count } | ConvertTo-Json -Depth 5 -Compress)
+      }
+      'remember' {
+        $f = Add-Fact -Text ([string]$a['text']) -Source 'chat'
+        return (@{ ok = $true; remembered = $f.text } | ConvertTo-Json -Compress)
+      }
+      'set_reminder' {
+        $minutes = [int]$a['minutes']
+        if ($minutes -lt 1) { $minutes = 1 }
+        $at = (Get-Date).AddMinutes($minutes)
+        $r = Add-Reminder -Text ([string]$a['text']) -At $at
+        return (@{ ok = $true; at = $at.ToString('yyyy-MM-dd HH:mm') } | ConvertTo-Json -Compress)
+      }
+      'search_memory' {
+        $hits = Search-Memory ([string]$a['query'])
+        $items = @()
+        foreach ($h in $hits) { $items += @{ kind = $h.kind; text = $h.text } }
+        return (@{ ok = $true; hits = $items } | ConvertTo-Json -Depth 5 -Compress)
+      }
+      'get_current_time' {
+        return (@{ ok = $true; now = (Get-Date).ToString('yyyy-MM-dd HH:mm dddd') } | ConvertTo-Json -Compress)
+      }
+      default {
+        return (@{ ok = $false; reason = '未知工具' } | ConvertTo-Json -Compress)
+      }
+    }
+  } catch {
+    return (@{ ok = $false; reason = $_.Exception.Message } | ConvertTo-Json -Compress)
+  }
+}
+
+# ============================================================================
+#  聊天（带工具循环）
 # ============================================================================
 function Get-ChatErrorText([int]$Status, [string]$Body) {
   switch ($Status) {
@@ -765,6 +981,106 @@ function Get-ChatErrorText([int]$Status, [string]$Body) {
   }
 }
 
+function Request-ChatRound {
+  $ctx = $script:ChatCtx
+  if (-not $ctx) { return }
+  $model = [string]$script:Config.model
+  if ([string]::IsNullOrWhiteSpace($model)) { $model = 'deepseek-chat' }
+  $payload = @{
+    model       = $model
+    messages    = $ctx.messages
+    tools       = (Get-ToolDefinitions)
+    tool_choice = 'auto'
+    temperature = 0.8
+  } | ConvertTo-Json -Depth 40 -Compress
+
+  $req = New-ApiRequest 'POST' 'https://api.deepseek.com/chat/completions' $ctx.key $payload
+  Start-HttpTask $req {
+    param($status, $body)
+    Handle-ChatResponse $status $body
+  }
+}
+
+function Handle-ChatResponse([int]$Status, [string]$Body) {
+  $ctx = $script:ChatCtx
+  if (-not $ctx) { return }
+  if ($Status -ne 200) {
+    Remove-ChatPlaceholder
+    Add-ChatBubble (Get-ChatErrorText $Status $Body) 'system' | Out-Null
+    Set-ChatBusy $false
+    $script:ChatCtx = $null
+    return
+  }
+
+  try { $obj = $Body | ConvertFrom-Json } catch {
+    Remove-ChatPlaceholder
+    Add-ChatBubble ('回复解析失败：' + $_.Exception.Message) 'system' | Out-Null
+    Set-ChatBusy $false
+    $script:ChatCtx = $null
+    return
+  }
+
+  $msg = $obj.choices[0].message
+  $toolCalls = @($msg.tool_calls)
+
+  if ($toolCalls.Count -gt 0 -and $ctx.depth -lt 4) {
+    $asst = @{ role = 'assistant'; content = ''; tool_calls = @() }
+    foreach ($tc in $toolCalls) {
+      $asst.tool_calls += @{
+        id       = [string]$tc.id
+        type     = 'function'
+        function = @{ name = [string]$tc.function.name; arguments = [string]$tc.function.arguments }
+      }
+    }
+    $ctx.messages += $asst
+    foreach ($tc in $toolCalls) {
+      $result = Invoke-PetTool ([string]$tc.function.name) ([string]$tc.function.arguments)
+      $ctx.messages += @{ role = 'tool'; tool_call_id = [string]$tc.id; content = $result }
+    }
+    $ctx.depth++
+    if ($script:ChatPlaceholderBubble) {
+      $script:ChatPlaceholderBubble.Child.Text = '小鲸鱼正在处理…'
+    }
+    Request-ChatRound
+    return
+  }
+
+  $reply = [string]$msg.content
+  if ([string]::IsNullOrWhiteSpace($reply)) { $reply = '（这次没想出话来说…）' }
+  Remove-ChatPlaceholder
+  Add-ChatBubble $reply 'assistant' | Out-Null
+  Set-ChatBusy $false
+  $script:ChatCtx = $null
+
+  Add-Turn -Role 'user' -Content $ctx.userText
+  Add-Turn -Role 'assistant' -Content $reply
+  $meta = Get-Meta
+  $meta.userTurns = [int]$meta.userTurns + 1
+  Save-Memory
+
+  if ($obj.usage) {
+    $today = (Get-Date).ToString('yyyy-MM-dd')
+    if ($script:Config.todayDate -ne $today) {
+      $script:Config.todayDate = $today
+      $script:Config.todayTokens = 0
+    }
+    $script:Config.todayTokens = [int]$script:Config.todayTokens + [int]$obj.usage.total_tokens
+    Save-Config
+  }
+
+  if (([int]$meta.userTurns - [int]$meta.lastExtractTurn) -ge 4) {
+    $meta.lastExtractTurn = $meta.userTurns
+    Save-Memory
+    Invoke-MemoryExtraction
+  }
+
+  if (-not $script:ChatVisible) {
+    Invoke-WhaleBounce
+    Show-Bubble '消息来啦～' '双击我看回复'
+  }
+  Refresh-MemoryPanel
+}
+
 function Send-ChatMessage {
   if ($script:ChatBusy) { return }
   $text = $script:ChatInput.Text
@@ -773,7 +1089,6 @@ function Send-ChatMessage {
   $script:ChatInput.Text = ''
   $script:ChatPlaceholder.Visibility = 'Visible'
   Add-ChatBubble $text 'user' | Out-Null
-  $script:ChatHistory += @{ role = 'user'; content = $text }
 
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) {
@@ -784,56 +1099,248 @@ function Send-ChatMessage {
   Set-ChatBusy $true
   $script:ChatPlaceholderBubble = Add-ChatBubble '小鲸鱼正在思考…' 'thinking'
 
-  $msgs = @()
-  $msgs += @{ role = 'system'; content = $script:SystemPrompt }
-  foreach ($m in ($script:ChatHistory | Select-Object -Last 12)) {
-    $msgs += @{ role = $m.role; content = $m.content }
+  $messages = @()
+  $messages += @{ role = 'system'; content = (Get-SystemPrompt (Get-MemoryDigest)) }
+  foreach ($t in @(Get-RecentTurns 14)) {
+    $messages += @{ role = $t.role; content = $t.content }
   }
+  $messages += @{ role = 'user'; content = $text }
+
+  $script:ChatCtx = @{ messages = $messages; depth = 0; key = $key; userText = $text }
+  Request-ChatRound
+}
+
+# ============================================================================
+#  记忆抽取 / 每日整理
+# ============================================================================
+function Invoke-MemoryExtraction {
+  if ($script:Extracting) { return }
+  $turns = @(Get-RecentTurns 12)
+  if ($turns.Count -lt 4) { return }
+  $key = Get-ApiKey
+  if ([string]::IsNullOrWhiteSpace($key)) { return }
+  $script:Extracting = $true
+
   $model = [string]$script:Config.model
   if ([string]::IsNullOrWhiteSpace($model)) { $model = 'deepseek-chat' }
   $payload = @{
     model       = $model
-    messages    = $msgs
-    stream      = $false
-    temperature = 1.0
-  } | ConvertTo-Json -Depth 10 -Compress
+    messages    = (Get-ExtractionMessages (Get-TurnsText $turns 4000))
+    temperature = 0.2
+  } | ConvertTo-Json -Depth 20 -Compress
 
   $req = New-ApiRequest 'POST' 'https://api.deepseek.com/chat/completions' $key $payload
   Start-HttpTask $req {
     param($status, $body)
-    if ($script:ChatPlaceholderBubble) {
-      $script:ChatPanel.Children.Remove($script:ChatPlaceholderBubble) | Out-Null
-      $script:ChatPlaceholderBubble = $null
-    }
-    Set-ChatBusy $false
-    if ($status -eq 200) {
-      try {
-        $obj = $body | ConvertFrom-Json
-        $reply = [string]$obj.choices[0].message.content
-        if ([string]::IsNullOrWhiteSpace($reply)) { $reply = '（这次没想出话来说…）' }
-        Add-ChatBubble $reply 'assistant' | Out-Null
-        $script:ChatHistory += @{ role = 'assistant'; content = $reply }
-        if ($obj.usage) {
-          $today = (Get-Date).ToString('yyyy-MM-dd')
-          if ($script:Config.todayDate -ne $today) {
-            $script:Config.todayDate = $today
-            $script:Config.todayTokens = 0
-          }
-          $script:Config.todayTokens = [int]$script:Config.todayTokens + [int]$obj.usage.total_tokens
-          Save-Config
-        }
-      } catch {
-        Add-ChatBubble ('回复解析失败：' + $_.Exception.Message) 'system' | Out-Null
+    $script:Extracting = $false
+    if ($status -ne 200) { return }
+    try {
+      $obj = $body | ConvertFrom-Json
+      $data = ConvertFrom-LooseJson ([string]$obj.choices[0].message.content)
+      if (-not $data) { return }
+      foreach ($f in @($data.facts)) {
+        if ($f) { Add-Fact -Text ([string]$f) -Source 'auto' | Out-Null }
       }
-    } else {
-      Add-ChatBubble (Get-ChatErrorText $status $body) 'system' | Out-Null
-    }
-    if (-not $script:ChatVisible) {
-      Invoke-WhaleBounce
-      Show-Bubble '消息来啦～' '双击我看回复'
-    }
+      foreach ($t in @($data.todos)) {
+        if ($t -and $t.text) { Add-Todo -Text ([string]$t.text) -Due ([string]$t.due) | Out-Null }
+      }
+      Write-Log ('记忆抽取完成: +facts ' + @($data.facts).Count + ' +todos ' + @($data.todos).Count)
+      Refresh-MemoryPanel
+    } catch { Write-Log ('记忆抽取失败: ' + $_.Exception.Message) }
   }
 }
+
+function Invoke-Reflection {
+  param([switch]$Manual)
+  if ($script:Reflecting) { return }
+  $date = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
+  $turns = @(Get-TurnsForDate $date)
+  if ($turns.Count -eq 0 -and $Manual) {
+    $date = (Get-Date).ToString('yyyy-MM-dd')
+    $turns = @(Get-RecentTurns 40)
+  }
+  if ($turns.Count -lt 2) {
+    if ($Manual) { Show-Bubble '还没什么可整理的' '先和我聊几句吧' }
+    return
+  }
+  $key = Get-ApiKey
+  if ([string]::IsNullOrWhiteSpace($key)) { return }
+  $script:Reflecting = $true
+  if ($script:MemWindow.IsVisible) { $script:MemStatus.Text = '整理中…' }
+
+  $model = [string]$script:Config.model
+  if ([string]::IsNullOrWhiteSpace($model)) { $model = 'deepseek-chat' }
+  $payload = @{
+    model       = $model
+    messages    = (Get-ReflectionMessages $date (Get-TurnsText $turns 5000))
+    temperature = 0.3
+  } | ConvertTo-Json -Depth 20 -Compress
+
+  $req = New-ApiRequest 'POST' 'https://api.deepseek.com/chat/completions' $key $payload
+  Start-HttpTask $req {
+    param($status, $body)
+    $script:Reflecting = $false
+    if ($status -ne 200) {
+      if ($script:MemWindow.IsVisible) { $script:MemStatus.Text = '整理失败（网络/Key）' }
+      return
+    }
+    try {
+      $obj = $body | ConvertFrom-Json
+      $data = ConvertFrom-LooseJson ([string]$obj.choices[0].message.content)
+      if (-not $data) { if ($script:MemWindow.IsVisible) { $script:MemStatus.Text = '整理结果解析失败' }; return }
+      if ($data.summary) { Add-Summary -Date $date -Text ([string]$data.summary) }
+      if ($data.traits) { Add-PersonaTraits -Traits @($data.traits) }
+      foreach ($f in @($data.facts)) { if ($f) { Add-Fact -Text ([string]$f) -Source 'reflection' | Out-Null } }
+      Set-MetaReflection ((Get-Date).ToString('yyyy-MM-dd'))
+      if ($script:MemWindow.IsVisible) { $script:MemStatus.Text = '整理完成 ✓'; Refresh-MemoryPanel }
+      Show-Bubble '整理好啦～' '我把今天记下来了'
+      Write-Log ('每日整理完成: ' + $date)
+    } catch { Write-Log ('每日整理失败: ' + $_.Exception.Message) }
+  }
+}
+
+# ============================================================================
+#  记忆面板
+# ============================================================================
+function Refresh-MemoryPanel {
+  if (-not $script:MemWindow) { return }
+  $script:MemBuilding = $true
+  try {
+    $stats = Get-MemoryStats
+    $script:MemStats.Text = ('事实 ' + $stats.facts + ' · 待办 ' + $stats.todos + ' · 摘要 ' + $stats.summaries + ' · 对话 ' + $stats.turns + ' 轮')
+
+    $script:FactsPanel.Children.Clear()
+    $facts = @((Get-Memory).facts)
+    if ($facts.Count -eq 0) {
+      $empty = New-Object System.Windows.Controls.TextBlock
+      $empty.Text = '还没有记住什么，跟我聊聊你的喜好、习惯、正在做的项目吧。'
+      $empty.FontSize = 11.5
+      $empty.Foreground = Get-Brush '#A9B4C2'
+      $empty.TextWrapping = 'Wrap'
+      $empty.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
+      [void]$script:FactsPanel.Children.Add($empty)
+    } else {
+      foreach ($f in $facts) {
+        $row = New-Object System.Windows.Controls.DockPanel
+        $row.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.Text = $f.text
+        $tb.TextWrapping = 'Wrap'
+        $tb.FontSize = 12
+        $tb.Foreground = Get-Brush '#3F4B5B'
+        $btn = New-Object System.Windows.Controls.Button
+        $btn.Content = '✕'
+        $btn.Tag = $f.id
+        $btn.Style = $script:MemWindow.FindResource('XBtn')
+        $btn.Add_Click({ param($s, $e) Remove-Fact ([string]$s.Tag); Refresh-MemoryPanel })
+        [System.Windows.Controls.DockPanel]::SetDock($btn, 'Right')
+        [void]$row.Children.Add($btn)
+        [void]$row.Children.Add($tb)
+        [void]$script:FactsPanel.Children.Add($row)
+      }
+    }
+
+    $script:TodoPanel.Children.Clear()
+    $todos = @((Get-Memory).todos)
+    $open = @($todos | Where-Object { -not $_.done })
+    if ($open.Count -eq 0) {
+      $empty2 = New-Object System.Windows.Controls.TextBlock
+      $empty2.Text = '没有待办。跟我说「记一下：明天交报告」试试。'
+      $empty2.FontSize = 11.5
+      $empty2.Foreground = Get-Brush '#A9B4C2'
+      $empty2.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
+      [void]$script:TodoPanel.Children.Add($empty2)
+    } else {
+      foreach ($t in $open) {
+        $row = New-Object System.Windows.Controls.DockPanel
+        $row.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
+        $btn = New-Object System.Windows.Controls.Button
+        $btn.Content = '✕'
+        $btn.Tag = $t.id
+        $btn.Style = $script:MemWindow.FindResource('XBtn')
+        $btn.Add_Click({ param($s, $e) Remove-Todo ([string]$s.Tag); Refresh-MemoryPanel })
+        [System.Windows.Controls.DockPanel]::SetDock($btn, 'Right')
+        [void]$row.Children.Add($btn)
+
+        $cb = New-Object System.Windows.Controls.CheckBox
+        $cb.Tag = $t.id
+        $cb.IsChecked = [bool]$t.done
+        $cb.VerticalAlignment = 'Center'
+        $cb.Margin = [System.Windows.Thickness]::new(0, 1, 6, 1)
+        $cb.Add_Checked({ param($s, $e) if ($script:MemBuilding) { return }; Complete-Todo -Id ([string]$s.Tag) | Out-Null; Refresh-MemoryPanel })
+        [System.Windows.Controls.DockPanel]::SetDock($cb, 'Left')
+        [void]$row.Children.Add($cb)
+
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.Text = $t.text
+        $tb.TextWrapping = 'Wrap'
+        $tb.FontSize = 12
+        $tb.Foreground = Get-Brush '#3F4B5B'
+        $tb.VerticalAlignment = 'Center'
+        if ($t.due) { $tb.Text = $tb.Text + '（' + $t.due + '）' }
+        [void]$row.Children.Add($tb)
+        [void]$script:TodoPanel.Children.Add($row)
+      }
+    }
+
+    $sums = @(Get-RecentSummaries 5)
+    if ($sums.Count -eq 0) {
+      $script:SummariesText.Text = '每晚会自动整理一次；也可以点右下角「整理记忆」马上做。'
+      $script:SummariesText.Foreground = Get-Brush '#A9B4C2'
+    } else {
+      $lines = @()
+      foreach ($s in $sums) { $lines += ($s.date + '：' + $s.text) }
+      $script:SummariesText.Text = ($lines -join "`r`n`r`n")
+      $script:SummariesText.Foreground = Get-Brush '#5B6B7F'
+    }
+
+    $script:PersonaBox.Text = (Get-PersonaText)
+  } finally {
+    $script:MemBuilding = $false
+  }
+}
+
+function Show-MemoryPanel {
+  if (-not $script:MemWindow.IsVisible) {
+    Refresh-MemoryPanel
+    $script:MemWindow.Show()
+  }
+  $script:MemWindow.Activate()
+}
+
+$script:MemClose.Add_Click({ $script:MemWindow.Hide() })
+$script:MemSavePersona.Add_Click({
+  Set-PersonaText ($script:PersonaBox.Text)
+  $script:MemStatus.Text = '人设已保存 ✓'
+})
+$script:MemTodoAdd.Add_Click({
+  $t = $script:MemTodoInput.Text
+  if ([string]::IsNullOrWhiteSpace($t)) { return }
+  Add-Todo -Text $t | Out-Null
+  $script:MemTodoInput.Text = ''
+  $script:MemStatus.Text = '已添加待办 ✓'
+  Refresh-MemoryPanel
+})
+$script:MemTodoInput.Add_KeyDown({
+  param($s, $e)
+  if ($e.Key -eq 'Return') {
+    $e.Handled = $true
+    $t = $script:MemTodoInput.Text
+    if ([string]::IsNullOrWhiteSpace($t)) { return }
+    Add-Todo -Text $t | Out-Null
+    $script:MemTodoInput.Text = ''
+    $script:MemStatus.Text = '已添加待办 ✓'
+    Refresh-MemoryPanel
+  }
+})
+$script:MemReflect.Add_Click({
+  $script:MemStatus.Text = '整理中…'
+  Invoke-Reflection -Manual
+})
+$script:MemWindow.Add_KeyDown({
+  param($s, $e)
+  if ($e.Key -eq 'Escape') { $script:MemWindow.Hide() }
+})
 
 # ============================================================================
 #  设置窗口
@@ -880,10 +1387,7 @@ $script:DragStart = $null
 
 $script:WhaleHost.Add_MouseLeftButtonDown({
   param($sender, $e)
-  if ($e.ClickCount -eq 2) {
-    Show-Chat
-    return
-  }
+  if ($e.ClickCount -eq 2) { Show-Chat; return }
   $script:DragStart = [System.Windows.Forms.Cursor]::Position
   try { $script:MainWindow.DragMove() } catch { }
   $end = [System.Windows.Forms.Cursor]::Position
@@ -895,24 +1399,34 @@ $script:WhaleHost.Add_MouseLeftButtonDown({
   if ($dist -lt 6) {
     Invoke-WhaleBounce
     $line = $script:IdleLines[(Get-Random -Maximum $script:IdleLines.Count)]
-    Show-Bubble $line (Get-StatusLine)
+    $todos = (Get-MemoryStats).todos
+    $sub = Get-StatusLine
+    if ($todos -gt 0) { $sub = '还有 ' + $todos + ' 条待办 · ' + $sub }
+    Show-Bubble $line $sub
   }
 })
 
-# ---------------------------------------------------------------- 右键菜单
 function New-MenuItem([string]$Header, [scriptblock]$Action, [bool]$Checkable = $false, [bool]$Checked = $false) {
   $mi = New-Object System.Windows.Controls.MenuItem
   $mi.Header = $Header
-  if ($Checkable) {
-    $mi.IsCheckable = $true
-    $mi.IsChecked = $Checked
-  }
+  if ($Checkable) { $mi.IsCheckable = $true; $mi.IsChecked = $Checked }
   if ($Action) { $mi.Add_Click($Action) }
   return $mi
 }
 
 $menu = New-Object System.Windows.Controls.ContextMenu
 $miChat = New-MenuItem '和我聊天' { Show-Chat }
+$miMemory = New-MenuItem '记忆与设定…' { Show-MemoryPanel }
+$miTodos = New-MenuItem '我的待办' {
+  $open = @(Get-OpenTodos)
+  if ($open.Count -eq 0) { Show-Bubble '现在没有待办' '跟我说「记一下…」就行' }
+  else {
+    $lines = @()
+    foreach ($t in @($open | Select-Object -First 5)) { $lines += ('· ' + $t.text) }
+    Show-Bubble ($lines -join "`n") ('共 ' + $open.Count + ' 条 · 打开聊天可以细说')
+  }
+}
+$miReflect = New-MenuItem '整理今天的记忆' { Invoke-Reflection -Manual }
 $miRefresh = New-MenuItem '刷新余额' { Refresh-Balance; Show-Bubble '刷新余额中…' }
 $miTop = New-MenuItem '始终置顶' {
   $script:Config.topmost = $miTop.IsChecked
@@ -930,16 +1444,21 @@ $miAuto = New-MenuItem '开机自启' {
   }
 } $true ([bool]$script:Config.autoStart)
 $miSettings = New-MenuItem '设置…' { Show-Settings }
+$miRestart = New-MenuItem '重启桌宠' { Restart-App }
 $miFolder = New-MenuItem '打开数据文件夹' { Start-Process explorer.exe $script:DataDir }
 $miExit = New-MenuItem '退出' { Exit-App }
 
 $menu.Items.Add($miChat) | Out-Null
+$menu.Items.Add($miMemory) | Out-Null
+$menu.Items.Add($miTodos) | Out-Null
+$menu.Items.Add($miReflect) | Out-Null
 $menu.Items.Add($miRefresh) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $menu.Items.Add($miTop) | Out-Null
 $menu.Items.Add($miAuto) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $menu.Items.Add($miSettings) | Out-Null
+$menu.Items.Add($miRestart) | Out-Null
 $menu.Items.Add($miFolder) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $menu.Items.Add($miExit) | Out-Null
@@ -954,17 +1473,24 @@ function Show-Chat {
     $left = $script:MainWindow.Left - $script:ChatWindow.Width - 6
     if ($left -lt $wa.Left) { $left = $script:MainWindow.Left + $script:MainWindow.Width + 6 }
     if ($left + $script:ChatWindow.Width -gt $wa.Right) { $left = $wa.Right - $script:ChatWindow.Width }
-    $top = $script:MainWindow.Top + 30
+    $top = $script:MainWindow.Top
     $top = [Math]::Max($wa.Top, [Math]::Min($top, $wa.Bottom - $script:ChatWindow.Height))
     $script:ChatWindow.Left = $left
     $script:ChatWindow.Top = $top
     $script:ChatWindow.Show()
     $script:ChatVisible = $true
     if ($script:ChatPanel.Children.Count -eq 0) {
+      $greet = '嗨，我是小鲸鱼～'
       if ([string]::IsNullOrWhiteSpace((Get-ApiKey))) {
         Add-ChatBubble '嗨，我是小鲸鱼～ 先右键我 →「设置」填一个 DeepSeek API Key，我们就能聊天了。' 'assistant' | Out-Null
       } else {
-        Add-ChatBubble '嗨，我是小鲸鱼～ 今天想聊点什么？' 'assistant' | Out-Null
+        $stats = Get-MemoryStats
+        if ($stats.facts -gt 0 -or $stats.todos -gt 0) {
+          $greet = '我回来啦～ 记得 ' + $stats.facts + ' 件事、' + $stats.todos + ' 条待办。今天想做什么？'
+        } else {
+          $greet = '嗨，我是小鲸鱼～ 今天想聊点什么？'
+        }
+        Add-ChatBubble $greet 'assistant' | Out-Null
       }
     }
     Refresh-Balance
@@ -974,31 +1500,24 @@ function Show-Chat {
 }
 
 $script:ChatClose.Add_Click({ $script:ChatWindow.Hide(); $script:ChatVisible = $false })
+$script:ChatMemory.Add_Click({ Show-MemoryPanel })
 $script:ChatSend.Add_Click({ Send-ChatMessage })
 $script:ChatInput.Add_KeyDown({
   param($sender, $e)
-  if ($e.Key -eq 'Return') {
-    $e.Handled = $true
-    Send-ChatMessage
-  }
+  if ($e.Key -eq 'Return') { $e.Handled = $true; Send-ChatMessage }
 })
 $script:ChatInput.Add_TextChanged({
-  if ($script:ChatInput.Text.Length -eq 0) {
-    $script:ChatPlaceholder.Visibility = 'Visible'
-  } else {
-    $script:ChatPlaceholder.Visibility = 'Collapsed'
-  }
+  if ($script:ChatInput.Text.Length -eq 0) { $script:ChatPlaceholder.Visibility = 'Visible' }
+  else { $script:ChatPlaceholder.Visibility = 'Collapsed' }
 })
-$script:ChatHeader.Add_MouseLeftButtonDown({
-  try { $script:ChatWindow.DragMove() } catch { }
-})
+$script:ChatHeader.Add_MouseLeftButtonDown({ try { $script:ChatWindow.DragMove() } catch { } })
 $script:ChatWindow.Add_KeyDown({
   param($sender, $e)
   if ($e.Key -eq 'Escape') { $script:ChatWindow.Hide(); $script:ChatVisible = $false }
 })
 
 # ============================================================================
-#  托盘图标
+#  托盘
 # ============================================================================
 function Initialize-Tray {
   try {
@@ -1012,17 +1531,18 @@ function Initialize-Tray {
 
     $cms = New-Object System.Windows.Forms.ContextMenuStrip
     $iShow = New-Object System.Windows.Forms.ToolStripMenuItem('显示 / 隐藏小鲸鱼')
-    $iShow.Add_Click({
-      if ($script:MainWindow.IsVisible) { $script:MainWindow.Hide() } else { $script:MainWindow.Show() }
-    })
+    $iShow.Add_Click({ if ($script:MainWindow.IsVisible) { $script:MainWindow.Hide() } else { $script:MainWindow.Show() } })
     $iChat = New-Object System.Windows.Forms.ToolStripMenuItem('和我聊天')
     $iChat.Add_Click({ Show-Chat })
+    $iMem = New-Object System.Windows.Forms.ToolStripMenuItem('记忆与设定')
+    $iMem.Add_Click({ Show-MemoryPanel })
     $iRefresh = New-Object System.Windows.Forms.ToolStripMenuItem('刷新余额')
     $iRefresh.Add_Click({ Refresh-Balance })
     $iExit = New-Object System.Windows.Forms.ToolStripMenuItem('退出')
     $iExit.Add_Click({ Exit-App })
     [void]$cms.Items.Add($iShow)
     [void]$cms.Items.Add($iChat)
+    [void]$cms.Items.Add($iMem)
     [void]$cms.Items.Add($iRefresh)
     [void]$cms.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void]$cms.Items.Add($iExit)
@@ -1030,17 +1550,25 @@ function Initialize-Tray {
     $tray.Add_MouseDoubleClick({ Show-Chat })
     $script:Tray = $tray
     $script:TrayMenu = $cms
-  } catch {
-    Write-Log ("托盘图标创建失败: " + $_.Exception.Message)
-  }
+  } catch { Write-Log ("托盘图标创建失败: " + $_.Exception.Message) }
 }
 
 function Exit-App {
   try { Save-Config } catch { }
   try { if ($script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() } } catch { }
+  try { $script:MemWindow.Close() } catch { }
   try { $script:ChatWindow.Close() } catch { }
   try { $script:MainWindow.Close() } catch { }
   [System.Windows.Application]::Current.Shutdown()
+}
+
+function Restart-App {
+  Save-Config
+  try {
+    $script:Restarting = $true
+    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', (Join-Path $script:AppDir 'WhalePet.ps1')) -WindowStyle Hidden
+  } catch { Write-Log ('重启失败: ' + $_.Exception.Message) }
+  Exit-App
 }
 
 # ============================================================================
@@ -1063,29 +1591,77 @@ function Start-IdleAnimations {
 }
 
 # ============================================================================
+#  提醒
+# ============================================================================
+$script:ReminderTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:ReminderTimer.Interval = [TimeSpan]::FromSeconds(20)
+$script:ReminderTimer.Add_Tick({
+  $due = Get-DueReminders (Get-Date)
+  foreach ($r in $due) {
+    Mark-ReminderFired $r.id
+    Show-Bubble ('⏰ ' + $r.text) '到点啦'
+    try {
+      if ($script:Tray) { $script:Tray.ShowBalloonTip(6000, '小鲸鱼提醒', $r.text, [System.Windows.Forms.ToolTipIcon]::Info) }
+    } catch { }
+  }
+})
+
+# ============================================================================
 #  启动
 # ============================================================================
 $script:App = New-Object System.Windows.Application
 $script:App.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+$script:App.Add_DispatcherUnhandledException({
+  param($s, $e)
+  Write-Log ('UI 异常: ' + $e.Exception.ToString())
+  $e.Handled = $true
+})
 
 $script:MainWindow.Add_Loaded({
   Write-Log 'Loaded: begin'
   Save-Config
   Start-IdleAnimations
-  Write-Log 'Loaded: animations started'
   Initialize-Tray
-  Write-Log 'Loaded: tray done'
   $script:BalanceTimer.Start()
-  Write-Log 'Loaded: timer started'
+  $script:ReminderTimer.Start()
+  Write-Log 'Loaded: timers started'
 
-  if ($script:FirstRun) {
-    Save-Config
-    Show-Bubble '嗨！我是小鲸鱼～' '拖我换位置 · 点我冒泡 · 双击聊天 · 右键有菜单'
+  $stats = Get-MemoryStats
+  if ($script:FreshMemory) {
+    Show-Bubble '我现在会记事啦～' '跟我说「记一下：…」试试'
+  } elseif ($stats.todos -gt 0) {
+    Show-Bubble ('你还有 ' + $stats.todos + ' 条待办哦') '双击我看看 · 右键有记忆面板'
   } elseif ([string]::IsNullOrWhiteSpace((Get-ApiKey))) {
     Show-Bubble '右键我 →「设置」' '填入 DeepSeek API Key，就能和我聊天啦'
   } else {
     Refresh-Balance
     Show-Bubble '我回来啦～' (Get-StatusLine)
+  }
+
+  $meta = Get-Meta
+  $today = (Get-Date).ToString('yyyy-MM-dd')
+  if ([string]$meta.lastReflection -ne $today) {
+    $yesterday = (Get-Date).AddDays(-1).ToString('yyyy-MM-dd')
+    if (@(Get-TurnsForDate $yesterday).Count -ge 2) {
+      Invoke-Reflection
+    } else {
+      Set-MetaReflection $today
+    }
+  }
+
+  if ($env:WHALEPET_OPEN_MEMORY -eq '1') { Show-MemoryPanel }
+  if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
+    $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)
+    $script:AutoTimer.Add_Tick({
+      $script:AutoTimer.Stop()
+      Show-Chat
+      if ($env:WHALEPET_SEND_TEST) {
+        $script:ChatInput.Text = $env:WHALEPET_SEND_TEST
+        Send-ChatMessage
+      }
+    })
+    $script:AutoTimer.Start()
   }
 })
 
