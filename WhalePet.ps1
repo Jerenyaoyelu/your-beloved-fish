@@ -358,6 +358,8 @@ $xamlChat = @'
                      Foreground="#17202B" Margin="8,0,0,0" VerticalAlignment="Center"/>
           <TextBlock x:Name="ChatBalance" Text="" FontSize="11" Foreground="#7A8798"
                      Margin="10,2,0,0" VerticalAlignment="Center"/>
+          <TextBlock x:Name="ChatStatus" Text="" FontSize="11" Foreground="#2F7CF6"
+                     Margin="12,2,0,0" VerticalAlignment="Center"/>
         </StackPanel>
         <Button x:Name="ChatMemory" Content="记忆" Style="{StaticResource IconBtn}"
                 Width="46" Height="30" HorizontalAlignment="Right" Margin="0,0,48,0"/>
@@ -1118,6 +1120,7 @@ $script:ChatSend = $script:ChatWindow.FindName('ChatSend')
 $script:ChatClose = $script:ChatWindow.FindName('ChatClose')
 $script:ChatMemory = $script:ChatWindow.FindName('ChatMemory')
 $script:ChatBalance = $script:ChatWindow.FindName('ChatBalance')
+$script:ChatStatus = $script:ChatWindow.FindName('ChatStatus')
 $script:ChatWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:ChatWindow })
 
 # ---------------------------------------------------------------- 错过提醒窗口
@@ -1204,6 +1207,188 @@ function Invoke-WhaleBounce {
 # ============================================================================
 #  聊天界面
 # ============================================================================
+function Add-MdInlines($Paragraph, [string]$Text, [string]$CodeBg, [string]$CodeFg, [string]$LinkFg) {
+  $pattern = '(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^\)]+\))'
+  foreach ($part in [regex]::Split($Text, $pattern)) {
+    if ([string]::IsNullOrEmpty($part)) { continue }
+    if ($part -match '^`([^`]+)`$') {
+      $run = New-Object System.Windows.Documents.Run($Matches[1])
+      $run.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas')
+      $run.Background = Get-Brush $CodeBg
+      $run.Foreground = Get-Brush $CodeFg
+      $Paragraph.Inlines.Add($run)
+    } elseif ($part -match '^\*\*([^*]+)\*\*$') {
+      $run = New-Object System.Windows.Documents.Run($Matches[1])
+      $run.FontWeight = 'Bold'
+      $Paragraph.Inlines.Add($run)
+    } elseif ($part -match '^\*([^*]+)\*$') {
+      $run = New-Object System.Windows.Documents.Run($Matches[1])
+      $run.FontStyle = 'Italic'
+      $Paragraph.Inlines.Add($run)
+    } elseif ($part -match '^\[([^\]]+)\]\(([^\)]+)\)$') {
+      $text = $Matches[1]; $url = $Matches[2]
+      try {
+        $link = New-Object System.Windows.Documents.Hyperlink
+        $link.NavigateUri = New-Object System.Uri($url)
+        $link.Inlines.Add((New-Object System.Windows.Documents.Run($text)))
+        $link.Foreground = Get-Brush $LinkFg
+        $Paragraph.Inlines.Add($link)
+      } catch {
+        $Paragraph.Inlines.Add((New-Object System.Windows.Documents.Run($text)))
+      }
+    } else {
+      $Paragraph.Inlines.Add((New-Object System.Windows.Documents.Run($part)))
+    }
+  }
+}
+
+function Convert-MarkdownToFlowDocument([string]$Text, [string]$Kind = 'assistant') {
+  switch ($Kind) {
+    'user'   { $fg = '#FFFFFF'; $codeBg = '#3D6FE0'; $codeFg = '#FFFFFF'; $linkFg = '#FFFFFF'; $fs = 13.2 }
+    'system' { $fg = '#7A5A20'; $codeBg = '#F3E7C9'; $codeFg = '#6B4C16'; $linkFg = '#2F7CF6'; $fs = 12 }
+    default  { $fg = '#1B2430'; $codeBg = '#EEF3FA'; $codeFg = '#B03A2E'; $linkFg = '#2F7CF6'; $fs = 13.2 }
+  }
+  $doc = New-Object System.Windows.Documents.FlowDocument
+  $doc.FontFamily = New-Object System.Windows.Media.FontFamily('Microsoft YaHei UI')
+  $doc.FontSize = $fs
+  $doc.Foreground = Get-Brush $fg
+  $doc.PagePadding = New-Object System.Windows.Thickness(0)
+  $doc.LineHeight = 19
+
+  $lines = ($Text -replace "`r", '') -split "`n"
+  $i = 0
+  while ($i -lt $lines.Count) {
+    $line = $lines[$i]
+
+    if ($line -match '^\s*```') {
+      $code = New-Object System.Collections.Generic.List[string]
+      $i++
+      while ($i -lt $lines.Count -and $lines[$i] -notmatch '^\s*```') { $code.Add($lines[$i]); $i++ }
+      $i++
+      $p = New-Object System.Windows.Documents.Paragraph
+      $p.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas')
+      $p.FontSize = 12
+      $p.Background = Get-Brush $codeBg
+      $p.Padding = New-Object System.Windows.Thickness(7, 5, 7, 5)
+      $p.Margin = New-Object System.Windows.Thickness(0, 2, 0, 4)
+      $p.Inlines.Add((New-Object System.Windows.Documents.Run(($code -join "`n"))))
+      $doc.Blocks.Add($p)
+      continue
+    }
+
+    if ($line -match '^\s*#{1,3}\s+(.+)$') {
+      $title = $Matches[1]
+      $p = New-Object System.Windows.Documents.Paragraph
+      $p.FontSize = 15
+      $p.FontWeight = 'Bold'
+      $p.Margin = New-Object System.Windows.Thickness(0, 6, 0, 3)
+      Add-MdInlines $p $title $codeBg $codeFg $linkFg
+      $doc.Blocks.Add($p)
+      $i++
+      continue
+    }
+
+    if ($line -match '^\s*[-*]\s+(.+)$') {
+      $list = New-Object System.Windows.Documents.List
+      $list.MarkerStyle = 'Disc'
+      $list.Margin = New-Object System.Windows.Thickness(12, 2, 0, 2)
+      while ($i -lt $lines.Count -and $lines[$i] -match '^\s*[-*]\s+(.+)$') {
+        $itemText = $Matches[1]
+        $li = New-Object System.Windows.Documents.ListItem
+        $p = New-Object System.Windows.Documents.Paragraph
+        $p.Margin = New-Object System.Windows.Thickness(0)
+        Add-MdInlines $p $itemText $codeBg $codeFg $linkFg
+        $li.Blocks.Add($p)
+        $list.ListItems.Add($li)
+        $i++
+      }
+      $doc.Blocks.Add($list)
+      continue
+    }
+
+    if ($line -match '^\s*\d+[\.、]\s+(.+)$') {
+      $list = New-Object System.Windows.Documents.List
+      $list.MarkerStyle = 'Decimal'
+      $list.Margin = New-Object System.Windows.Thickness(12, 2, 0, 2)
+      while ($i -lt $lines.Count -and $lines[$i] -match '^\s*\d+[\.、]\s+(.+)$') {
+        $itemText = $Matches[1]
+        $li = New-Object System.Windows.Documents.ListItem
+        $p = New-Object System.Windows.Documents.Paragraph
+        $p.Margin = New-Object System.Windows.Thickness(0)
+        Add-MdInlines $p $itemText $codeBg $codeFg $linkFg
+        $li.Blocks.Add($p)
+        $list.ListItems.Add($li)
+        $i++
+      }
+      $doc.Blocks.Add($list)
+      continue
+    }
+
+    if ($line -match '^\s*>\s?(.*)$') {
+      $quote = $Matches[1]
+      $p = New-Object System.Windows.Documents.Paragraph
+      $p.FontStyle = 'Italic'
+      $p.Margin = New-Object System.Windows.Thickness(8, 2, 0, 2)
+      Add-MdInlines $p $quote $codeBg $codeFg $linkFg
+      $doc.Blocks.Add($p)
+      $i++
+      continue
+    }
+
+    if ($line -match '^\s*[-*_]{3,}\s*$') {
+      $p = New-Object System.Windows.Documents.Paragraph
+      $p.BorderBrush = Get-Brush '#DDE6F2'
+      $p.BorderThickness = New-Object System.Windows.Thickness(0, 0, 0, 1)
+      $p.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
+      $doc.Blocks.Add($p)
+      $i++
+      continue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($line)) { $i++; continue }
+
+    $p = New-Object System.Windows.Documents.Paragraph
+    $p.Margin = New-Object System.Windows.Thickness(0, 1, 0, 1)
+    Add-MdInlines $p $line $codeBg $codeFg $linkFg
+    $doc.Blocks.Add($p)
+    $i++
+  }
+  return $doc
+}
+
+function New-ChatContent([string]$Text, [string]$Kind = 'assistant') {
+  $rtb = New-Object System.Windows.Controls.RichTextBox
+  $rtb.IsReadOnly = $true
+  $rtb.IsDocumentEnabled = $true
+  $rtb.BorderThickness = New-Object System.Windows.Thickness(0)
+  $rtb.Background = [System.Windows.Media.Brushes]::Transparent
+  $rtb.Padding = New-Object System.Windows.Thickness(0)
+  $rtb.Margin = New-Object System.Windows.Thickness(0)
+  $rtb.Width = 296
+  $rtb.VerticalScrollBarVisibility = 'Disabled'
+  $rtb.HorizontalScrollBarVisibility = 'Disabled'
+  $rtb.IsTabStop = $false
+  $rtb.Cursor = 'IBeam'
+  $rtb.Document = Convert-MarkdownToFlowDocument $Text $Kind
+  $rtb.Add_PreviewMouseWheel({
+    param($s, $e)
+    if ($script:ChatScroll) {
+      $script:ChatScroll.ScrollToVerticalOffset($script:ChatScroll.VerticalOffset - ($e.Delta / 3))
+      $e.Handled = $true
+    }
+  })
+  return $rtb
+}
+
+function Set-BubbleContent($Bubble, [string]$Text) {
+  if (-not $Bubble) { return }
+  if ($Bubble.Child -is [System.Windows.Controls.RichTextBox]) {
+    $Bubble.Child.Document = Convert-MarkdownToFlowDocument $Text ([string]$Bubble.Tag)
+  } elseif ($Bubble.Child) {
+    $Bubble.Child.Text = $Text
+  }
+}
+
 function Add-ChatBubble {
   param([string]$Text, [string]$Kind = 'assistant')
   $b = New-Object System.Windows.Controls.Border
@@ -1211,48 +1396,44 @@ function Add-ChatBubble {
   $b.Padding = [System.Windows.Thickness]::new(11, 7, 11, 7)
   $b.Margin = [System.Windows.Thickness]::new(4, 3, 4, 3)
   $b.MaxWidth = 320
-  $tb = New-Object System.Windows.Controls.TextBlock
-  $tb.Text = $Text
-  $tb.TextWrapping = 'Wrap'
-  $tb.FontSize = 13.2
-  $tb.LineHeight = 19
+  $b.Tag = $Kind
+  $content = New-ChatContent $Text $Kind
   switch ($Kind) {
     'user' {
       $b.Background = Get-Brush '#2F7CF6'
-      $tb.Foreground = [System.Windows.Media.Brushes]::White
       $b.HorizontalAlignment = 'Right'
     }
     'thinking' {
       $b.Background = Get-Brush '#F6F8FB'
-      $tb.Foreground = Get-Brush '#8A97A8'
-      $tb.FontStyle = 'Italic'
       $b.HorizontalAlignment = 'Left'
     }
     'system' {
       $b.Background = Get-Brush '#FFF7E8'
-      $tb.Foreground = Get-Brush '#8A6A2F'
-      $tb.FontSize = 12
-      $tb.LineHeight = 17
       $b.HorizontalAlignment = 'Left'
     }
     default {
       $b.Background = Get-Brush '#F0F4FA'
-      $tb.Foreground = Get-Brush '#1B2430'
       $b.HorizontalAlignment = 'Left'
     }
   }
-  $b.Child = $tb
+  $b.Child = $content
   $script:ChatPanel.Children.Add($b) | Out-Null
   $script:ChatScroll.UpdateLayout()
   $script:ChatScroll.ScrollToEnd()
   return $b
 }
 
+function Set-ChatStatus([string]$Text, [string]$Color = '#2F7CF6') {
+  if (-not $script:ChatStatus) { return }
+  $script:ChatStatus.Text = $Text
+  $script:ChatStatus.Foreground = Get-Brush $Color
+}
+
 function Set-ChatBusy([bool]$Busy) {
   $script:ChatBusy = $Busy
   $script:ChatSend.IsEnabled = -not $Busy
   $script:ChatInput.IsEnabled = -not $Busy
-  if (-not $Busy) { $script:ChatInput.Focus() | Out-Null }
+  if (-not $Busy) { $script:ChatInput.Focus() | Out-Null; if (-not $script:ConversationActive) { Set-ChatStatus '' } }
 }
 
 function Update-ChatBalance {
@@ -1437,6 +1618,7 @@ function Speak-Reply([string]$Text, [switch]$Force) {
     if ($clean.Length -gt 300) { $clean = $clean.Substring(0, 300) }
     if (-not $clean) { return }
     $script:Synth.SpeakAsyncCancelAll()
+    Set-ChatStatus '🔊 正在说…'
     $prompt = $script:Synth.SpeakAsync($clean)
     Write-Log ('TTS 朗读: ' + $clean.Length + ' 字, state=' + $script:Synth.State)
   } catch { Write-Log ('TTS 失败: ' + $_.Exception.Message) }
@@ -1512,6 +1694,7 @@ function Start-VoiceInput {
   } else {
     Show-Bubble '我在听…' '说完停一下 · 再按 Ctrl+Alt+V 取消'
   }
+  Set-ChatStatus '🎤 正在听…'
   [void]$script:VoiceTimer.Start()
 }
 
@@ -1522,6 +1705,7 @@ function Stop-VoiceInput {
   $script:VoiceTimer.Stop()
   $script:VoiceListening = $false
   $script:VoiceProc = $null
+  Set-ChatStatus ''
 }
 
 function Toggle-Voice {
@@ -1553,6 +1737,7 @@ function Update-VoiceInput {
     $err = if ($obj -and $obj.error) { [string]$obj.error } else { '没有返回结果' }
     Show-Bubble '语音识别失败' $err
     Write-Log ('语音失败: ' + $err)
+    Set-ChatStatus ''
     if ($script:ConversationActive) { End-Conversation }
     return
   }
@@ -1561,19 +1746,22 @@ function Update-VoiceInput {
   if (-not $text) {
     $peak = if ($obj.peak) { [string]$obj.peak + ' / ' + [string]$obj.threshold } else { '?' }
     Write-Log ('语音无输入: peak/threshold=' + $peak)
+    Set-ChatStatus ''
     if ($script:ConversationActive) { End-Conversation '没听到声音，先退出' }
     else { Show-Bubble '没听清…' '再说一次？' }
     return
   }
 
   if ($text -match '^(再见|拜拜|退出|不聊了|结束|停止)[。！!]?$') {
+    Set-ChatStatus ''
     if ($script:ConversationActive) { End-Conversation '好，再见' }
     else { Show-Bubble '好～' }
     return
   }
 
   if ($script:ConversationActive) {
-    $needMore = ($text.Length -lt 4) -or ($text -match '(的|和|跟|然后|所以|因为|就是|那个|这个|但是|而且|还有|我想|我要|帮我|给我|把|对|在|从|如果|虽然|或者|以及|的话)[，,。！？!?]?$')
+    $shortComplete = $text -match '^(好的|好|好呀|好滴|行|可以|对的|是的|需要|要|不要|不用|继续|开始|取消|谢谢|嗯|对|没问题|确认|ok|OK|收到|明白)[。！!，,~～]?$'
+    $needMore = (-not $shortComplete) -and ($text.Length -ge 3) -and ($text -match '(的|和|跟|然后|所以|因为|就是|那个|这个|但是|而且|还有|我想|我要|帮我|给我|把|对|在|从|如果|虽然|或者|以及|的话)[，,。！？!?]?$')
     if ($needMore -and $script:VoiceExtend -lt 3 -and ($script:VoiceBuffer.Length + $text.Length) -lt 80) {
       $script:VoiceBuffer = ($script:VoiceBuffer + ' ' + $text).Trim()
       $script:VoiceExtend++
@@ -1586,6 +1774,7 @@ function Update-VoiceInput {
     $script:VoiceBuffer = ''
     $script:VoiceExtend = 0
     Write-Log ('语音识别: ' + $text)
+    Set-ChatStatus '🤔 正在想…'
     $script:ChatInput.Text = $text
     Send-ChatMessage
     return
@@ -1757,7 +1946,7 @@ function Update-DshLiveBubble($Run) {
   if (-not $Run.bubble) {
     $Run.bubble = Add-ChatBubble ([string]$Run.text) 'assistant'
   } else {
-    $Run.bubble.Child.Text = [string]$Run.text
+    Set-BubbleContent $Run.bubble ([string]$Run.text)
     $script:ChatScroll.ScrollToEnd()
   }
 }
@@ -1807,6 +1996,7 @@ function Start-DshTask([string]$Task) {
     Show-Bubble '找不到 DSH' '检查安装路径，或改 config.json 里的 dshRoot'
     return
   }
+  Set-ChatStatus '🤔 正在想…'
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) {
     Show-Bubble '需要先配置 API Key' '右键 →「设置」'
@@ -1863,6 +2053,7 @@ function Start-DshTask([string]$Task) {
     usedSession = $usedSession
   }
   [void]$script:DshTimer.Start()
+  Set-ChatStatus '🤔 DSH 处理中…'
 }
 
 $script:DshTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1898,7 +2089,7 @@ $script:DshTimer.Add_Tick({
   if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) + '…' }
 
   if (-not [string]::IsNullOrWhiteSpace($text)) {
-    if ($run.bubble) { $run.bubble.Child.Text = $text }
+    if ($run.bubble) { Set-BubbleContent $run.bubble $text }
     else { Add-ChatBubble $text 'assistant' | Out-Null }
     Speak-Reply $text
     Show-Bubble 'DSH 回来啦' ('用时 ' + $elapsed + ' 秒')
@@ -1914,6 +2105,7 @@ $script:DshTimer.Add_Tick({
     }
   }
   $script:DshRun = $null
+  Set-ChatStatus ''
   Write-Log ('DSH 完成: ' + $elapsed + 's session=' + $run.sessionId)
 })
 
@@ -1995,6 +2187,7 @@ function Refresh-Balance {
     try { Apply-BalanceValue ([double]$fake) 'CNY' } catch { }
     return
   }
+  Set-ChatStatus '🤔 正在想…'
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) { $script:BalanceText = ''; Update-ChatBalance; return }
   if ($script:BalanceBusy) { return }
@@ -2212,7 +2405,7 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
     }
     $ctx.depth++
     if ($script:ChatPlaceholderBubble) {
-      $script:ChatPlaceholderBubble.Child.Text = '小鲸鱼正在处理…'
+      Set-BubbleContent $script:ChatPlaceholderBubble '小鲸鱼正在处理…'
     }
     Request-ChatRound
     return
@@ -2227,6 +2420,7 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
     Wait-Speech
     if ($script:ConversationActive) { Start-VoiceInput -Conversation }
   }
+  if (-not $script:ConversationActive) { Set-ChatStatus '' }
   Set-ChatBusy $false
   $script:ChatCtx = $null
 
@@ -2300,6 +2494,7 @@ function Send-ChatMessage {
     }
   }
 
+  Set-ChatStatus '🤔 正在想…'
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) {
     Add-ChatBubble '还没有 API Key 呢～ 右键小鲸鱼 →「设置」，把 sk- 开头的 Key 填进来就能聊天啦。' 'system' | Out-Null
@@ -2331,6 +2526,7 @@ function Invoke-MemoryExtraction {
   if ($script:Extracting) { return }
   $turns = @(Get-RecentTurns 12)
   if ($turns.Count -lt 4) { return }
+  Set-ChatStatus '🤔 正在想…'
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) { return }
   $script:Extracting = $true
@@ -2378,6 +2574,7 @@ function Invoke-Reflection {
     if ($Manual) { Show-Bubble '还没什么可整理的' '先和我聊几句吧' }
     return
   }
+  Set-ChatStatus '🤔 正在想…'
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) { return }
   $script:Reflecting = $true
