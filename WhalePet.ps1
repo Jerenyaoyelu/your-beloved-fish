@@ -65,9 +65,11 @@ trap {
 # ---------------------------------------------------------------- 模块
 Import-Module (Join-Path $script:AppDir 'lib\Store.psm1') -Force
 Import-Module (Join-Path $script:AppDir 'lib\Brain.psm1') -Force
+Import-Module (Join-Path $script:AppDir 'lib\Skins.psm1') -Force
 
 $script:FreshMemory = -not (Test-Path (Join-Path $script:DataDir 'memory.json'))
 Initialize-Store -DataDir $script:DataDir
+Initialize-Skins -DataDir $script:DataDir -DefaultImage $script:WhalePng
 
 # ---------------------------------------------------------------- 单实例
 $script:Mutex = New-Object System.Threading.Mutex($false, 'Local\DeepSeekWhalePet')
@@ -88,6 +90,7 @@ function New-DefaultConfig {
     topmost         = $true
     autoStart       = $true
     lowBalanceThreshold = 5
+    lastBalanceLow  = $false
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
   }
@@ -589,6 +592,96 @@ $xamlMissed = @'
 '@
 
 # ============================================================================
+#  XAML — 皮肤
+# ============================================================================
+$xamlSkin = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="皮肤" Width="620" Height="600"
+        WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" FontFamily="Microsoft YaHei UI">
+  <Window.Resources>
+    <Style x:Key="PrimaryBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#2F7CF6" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#1E6BE6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="GhostBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#5B6B7F"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#EEF3FA" CornerRadius="10" Padding="16,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#E3EBF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Border CornerRadius="20" Background="#FFFDFB" BorderBrush="#E6EDF7"
+          BorderThickness="1" Margin="12">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="30" ShadowDepth="5" Opacity="0.24" Color="#12203A"/>
+    </Border.Effect>
+    <Grid Margin="22,18,22,16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <StackPanel Grid.Row="0">
+        <TextBlock Text="皮肤" FontSize="17" FontWeight="SemiBold" Foreground="#17202B"/>
+        <TextBlock Text="支持 PNG / GIF / JPG，建议透明背景、正方形；GIF 会动。" FontSize="11.5"
+                   Foreground="#8A97A8" Margin="0,6,0,0"/>
+      </StackPanel>
+
+      <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,10,0,0">
+        <StackPanel x:Name="SkinsPanel"/>
+      </ScrollViewer>
+
+      <Grid Grid.Row="2" Margin="0,12,0,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock x:Name="SkinStatus" FontSize="11" Foreground="#8A97A8" VerticalAlignment="Center"/>
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <Button x:Name="SkinImport" Content="导入图片" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+          <Button x:Name="SkinDefault" Content="恢复默认" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+          <Button x:Name="SkinClose" Content="关闭" Style="{StaticResource PrimaryBtn}"/>
+        </StackPanel>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+# ============================================================================
 #  XAML — 设置窗口
 # ============================================================================
 $xamlSettings = @'
@@ -723,6 +816,11 @@ $script:MissedIds = @()
 $script:MissedPending = @()
 $script:BalanceWarned = $false
 $script:LastBalanceWarnAt = $null
+$script:BalanceWasLow = [bool]$script:Config.lastBalanceLow
+$script:GifFrames = @()
+$script:GifIndex = 0
+$script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:GifTimer.Interval = [TimeSpan]::FromMilliseconds(100)
 $script:IdleLines = @(
   '在呢在呢～', '摸摸头～', '今天也辛苦啦', '要不要聊两句？',
   '点我干嘛呀，嘿嘿', '我一直在这儿哦', '喝口水休息一下嘛', '嘿！'
@@ -786,6 +884,15 @@ $script:MissedReplay = $script:MissedWindow.FindName('MissedReplay')
 $script:MissedIgnore = $script:MissedWindow.FindName('MissedIgnore')
 $script:MissedLater = $script:MissedWindow.FindName('MissedLater')
 $script:MissedWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:MissedWindow })
+
+# ---------------------------------------------------------------- 皮肤窗口
+$script:SkinWindow = New-WindowFromXaml $xamlSkin
+$script:SkinsPanel = $script:SkinWindow.FindName('SkinsPanel')
+$script:SkinStatus = $script:SkinWindow.FindName('SkinStatus')
+$script:SkinImport = $script:SkinWindow.FindName('SkinImport')
+$script:SkinDefault = $script:SkinWindow.FindName('SkinDefault')
+$script:SkinClose = $script:SkinWindow.FindName('SkinClose')
+$script:SkinWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:SkinWindow })
 
 # ---------------------------------------------------------------- 记忆窗口
 $script:MemWindow = New-WindowFromXaml $xamlMemory
@@ -987,7 +1094,38 @@ function Notify-BalanceLow([string]$Detail = '', [switch]$Force) {
   Write-Log ('余额提醒: ' + $sub)
 }
 
+function Apply-BalanceValue([double]$Total, [string]$Currency) {
+  $sym = if ($Currency -eq 'USD') { '$' } else { '¥' }
+  $script:BalanceText = '余额 ' + $sym + $Total.ToString('0.00')
+  $script:BalanceOk = $true
+  $threshold = 5.0
+  try { if ($script:Config.lowBalanceThreshold) { $threshold = [double]$script:Config.lowBalanceThreshold } } catch { }
+  if ($Total -lt $threshold) {
+    $script:BalanceWasLow = $true
+    $script:Config.lastBalanceLow = $true
+    Save-Config
+    Notify-BalanceLow ('现在只剩 ' + $sym + $Total.ToString('0.00') + ' 了')
+  } elseif ($script:BalanceWasLow) {
+    $script:BalanceWasLow = $false
+    $script:BalanceWarned = $false
+    $script:LastBalanceWarnAt = $null
+    $script:Config.lastBalanceLow = $false
+    Save-Config
+    Show-Bubble '余额回来啦～' ('现在 ' + $sym + $Total.ToString('0.00') + '，可以继续聊了')
+    try {
+      if ($script:Tray) { $script:Tray.ShowBalloonTip(6000, '小鲸鱼：余额恢复', '可以继续聊啦', [System.Windows.Forms.ToolTipIcon]::Info) }
+    } catch { }
+    Write-Log ('余额恢复: ' + $sym + $Total.ToString('0.00'))
+  }
+  Update-ChatBalance
+}
+
 function Refresh-Balance {
+  $fake = $env:WHALEPET_FAKE_BALANCE
+  if ($fake) {
+    try { Apply-BalanceValue ([double]$fake) 'CNY' } catch { }
+    return
+  }
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) { $script:BalanceText = ''; Update-ChatBalance; return }
   if ($script:BalanceBusy) { return }
@@ -1002,25 +1140,18 @@ function Refresh-Balance {
         $infos = @($obj.balance_infos)
         if ($infos.Count -gt 0) {
           $info = $infos[0]
-          $cur = [string]$info.currency
-          $sym = if ($cur -eq 'USD') { '$' } else { '¥' }
-          $script:BalanceText = '余额 ' + $sym + ([double]$info.total_balance).ToString('0.00')
-          $script:BalanceOk = $true
-          $threshold = 5.0
-          try { if ($script:Config.lowBalanceThreshold) { $threshold = [double]$script:Config.lowBalanceThreshold } } catch { }
-          if ([double]$info.total_balance -lt $threshold) {
-            Notify-BalanceLow ('现在只剩 ' + $sym + ([double]$info.total_balance).ToString('0.00') + ' 了')
-          }
+          Apply-BalanceValue ([double]$info.total_balance) ([string]$info.currency)
         } else {
           $script:BalanceText = ''
           $script:BalanceOk = $false
+          Update-ChatBalance
         }
       } catch { Write-Log ("余额解析失败: " + $_.Exception.Message) }
     } elseif ($status -eq 401) {
       $script:BalanceText = 'Key 无效'
       $script:BalanceOk = $false
+      Update-ChatBalance
     }
-    Update-ChatBalance
   }
 }
 
@@ -1629,6 +1760,7 @@ $miAuto = New-MenuItem '开机自启' {
   }
 } $true ([bool]$script:Config.autoStart)
 $miSettings = New-MenuItem '设置…' { Show-Settings }
+$miSkin = New-MenuItem '换皮肤…' { Show-SkinPanel }
 $miRestart = New-MenuItem '重启桌宠' { Restart-App }
 $miFolder = New-MenuItem '打开数据文件夹' { Start-Process explorer.exe $script:DataDir }
 $miExit = New-MenuItem '退出' { Exit-App }
@@ -1643,6 +1775,7 @@ $menu.Items.Add($miTop) | Out-Null
 $menu.Items.Add($miAuto) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $menu.Items.Add($miSettings) | Out-Null
+$menu.Items.Add($miSkin) | Out-Null
 $menu.Items.Add($miRestart) | Out-Null
 $menu.Items.Add($miFolder) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
@@ -1721,6 +1854,8 @@ function Initialize-Tray {
     $iChat.Add_Click({ Show-Chat })
     $iMem = New-Object System.Windows.Forms.ToolStripMenuItem('记忆与设定')
     $iMem.Add_Click({ Show-MemoryPanel })
+    $iSkin = New-Object System.Windows.Forms.ToolStripMenuItem('换皮肤')
+    $iSkin.Add_Click({ Show-SkinPanel })
     $iRefresh = New-Object System.Windows.Forms.ToolStripMenuItem('刷新余额')
     $iRefresh.Add_Click({ Refresh-Balance })
     $iExit = New-Object System.Windows.Forms.ToolStripMenuItem('退出')
@@ -1728,6 +1863,7 @@ function Initialize-Tray {
     [void]$cms.Items.Add($iShow)
     [void]$cms.Items.Add($iChat)
     [void]$cms.Items.Add($iMem)
+    [void]$cms.Items.Add($iSkin)
     [void]$cms.Items.Add($iRefresh)
     [void]$cms.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void]$cms.Items.Add($iExit)
@@ -1776,6 +1912,183 @@ function Start-IdleAnimations {
 }
 
 # ============================================================================
+#  皮肤
+# ============================================================================
+function Get-GifDelay($Frame) {
+  try {
+    $d = $Frame.Metadata.GetQuery('/grctlext/Delay')
+    if ($d -and [int]$d -gt 0) { return [TimeSpan]::FromMilliseconds([int]$d * 10) }
+  } catch { }
+  return [TimeSpan]::FromMilliseconds(100)
+}
+
+function Apply-Skin([string]$Id) {
+  $path = Get-SkinPath $Id
+  $script:GifTimer.Stop()
+  $script:GifFrames = @()
+  try {
+    if ([System.IO.Path]::GetExtension($path).ToLowerInvariant() -eq '.gif') {
+      $decoder = New-Object System.Windows.Media.Imaging.GifBitmapDecoder(
+        (New-Object System.Uri($path)),
+        [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat,
+        [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+      $frames = @($decoder.Frames)
+      if ($frames.Count -gt 0) {
+        $script:GifFrames = $frames
+        $script:GifIndex = 0
+        $script:WhaleImage.Source = $frames[0]
+        if ($frames.Count -gt 1) {
+          $script:GifTimer.Interval = Get-GifDelay $frames[0]
+          $script:GifTimer.Start()
+        }
+        return
+      }
+    }
+  } catch { Write-Log ('GIF 加载失败: ' + $_.Exception.Message) }
+
+  $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+  $bi.BeginInit()
+  $bi.CacheOption = 'OnLoad'
+  $bi.UriSource = New-Object System.Uri($path)
+  $bi.EndInit()
+  $script:WhaleImage.Source = $bi
+}
+
+$script:GifTimer.Add_Tick({
+  if ($script:GifFrames.Count -lt 2) { $script:GifTimer.Stop(); return }
+  $script:GifIndex = ($script:GifIndex + 1) % $script:GifFrames.Count
+  $script:WhaleImage.Source = $script:GifFrames[$script:GifIndex]
+  try { $script:GifTimer.Interval = Get-GifDelay $script:GifFrames[$script:GifIndex] } catch { }
+})
+
+function Get-SkinPreview($Id) {
+  $path = Get-SkinPath $Id
+  try {
+    $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+    $bi.BeginInit()
+    $bi.CacheOption = 'OnLoad'
+    $bi.DecodePixelWidth = 72
+    $bi.UriSource = New-Object System.Uri($path)
+    $bi.EndInit()
+    return $bi
+  } catch { return $null }
+}
+
+function Refresh-SkinPanel {
+  $script:SkinsPanel.Children.Clear()
+  $activeId = Get-ActiveSkinId
+  foreach ($s in Get-Skins) {
+    $row = New-Object System.Windows.Controls.DockPanel
+    $row.Margin = [System.Windows.Thickness]::new(0, 4, 0, 4)
+
+    $img = New-Object System.Windows.Controls.Image
+    $img.Width = 56
+    $img.Height = 56
+    $img.Stretch = 'Uniform'
+    $img.Source = Get-SkinPreview $s.id
+    [System.Windows.Controls.DockPanel]::SetDock($img, 'Left')
+    [void]$row.Children.Add($img)
+
+    $btns = New-Object System.Windows.Controls.StackPanel
+    $btns.Orientation = 'Horizontal'
+    $btns.VerticalAlignment = 'Center'
+    [System.Windows.Controls.DockPanel]::SetDock($btns, 'Right')
+
+    if ($s.id -eq $activeId) {
+      $tag = New-Object System.Windows.Controls.TextBlock
+      $tag.Text = '使用中'
+      $tag.FontSize = 11.5
+      $tag.Foreground = Get-Brush '#2F7CF6'
+      $tag.Margin = [System.Windows.Thickness]::new(0, 0, 8, 0)
+      $tag.VerticalAlignment = 'Center'
+      [void]$btns.Children.Add($tag)
+    } else {
+      $use = New-Object System.Windows.Controls.Button
+      $use.Content = '使用'
+      $use.Style = $script:SkinWindow.FindResource('GhostBtn')
+      $use.Padding = [System.Windows.Thickness]::new(12, 5, 12, 5)
+      $use.Tag = $s.id
+      $use.Add_Click({
+        param($sender, $e)
+        $id = [string]$sender.Tag
+        Set-ActiveSkinId $id
+        Apply-Skin $id
+        Refresh-SkinPanel
+        Show-Bubble '换好皮肤啦～' ('现在用的是「' + (Get-SkinById $id).name + '」')
+      })
+      [void]$btns.Children.Add($use)
+    }
+
+    if (-not $s.builtin -and $s.id -ne 'default') {
+      $del = New-Object System.Windows.Controls.Button
+      $del.Content = '删除'
+      $del.Style = $script:SkinWindow.FindResource('GhostBtn')
+      $del.Padding = [System.Windows.Thickness]::new(10, 5, 10, 5)
+      $del.Margin = [System.Windows.Thickness]::new(8, 0, 0, 0)
+      $del.Tag = $s.id
+      $del.Add_Click({
+        param($sender, $e)
+        $id = [string]$sender.Tag
+        $wasActive = ((Get-ActiveSkinId) -eq $id)
+        Remove-Skin $id | Out-Null
+        if ($wasActive) { Apply-Skin (Get-ActiveSkinId) }
+        Refresh-SkinPanel
+        Show-Bubble '删掉啦' '已切回默认皮肤'
+      })
+      [void]$btns.Children.Add($del)
+    }
+    [void]$row.Children.Add($btns)
+
+    $name = New-Object System.Windows.Controls.TextBlock
+    $name.Text = $s.name
+    $name.FontSize = 13
+    $name.Foreground = Get-Brush '#3F4B5B'
+    $name.VerticalAlignment = 'Center'
+    $name.Margin = [System.Windows.Thickness]::new(14, 0, 10, 0)
+    $name.TextWrapping = 'Wrap'
+    [void]$row.Children.Add($name)
+
+    [void]$script:SkinsPanel.Children.Add($row)
+  }
+  $active = Get-SkinById $activeId
+  if ($active) { $script:SkinStatus.Text = ('当前：' + $active.name) }
+}
+
+function Show-SkinPanel {
+  Refresh-SkinPanel
+  if (-not $script:SkinWindow.IsVisible) { $script:SkinWindow.Show() }
+  $script:SkinWindow.Activate()
+}
+
+$script:SkinClose.Add_Click({ $script:SkinWindow.Hide() })
+$script:SkinDefault.Add_Click({
+  Set-ActiveSkinId 'default'
+  Apply-Skin 'default'
+  Refresh-SkinPanel
+  Show-Bubble '已恢复默认皮肤'
+})
+$script:SkinImport.Add_Click({
+  $dlg = New-Object System.Windows.Forms.OpenFileDialog
+  $dlg.Title = '选择皮肤图片'
+  $dlg.Filter = '图片 (*.png;*.gif;*.jpg;*.jpeg)|*.png;*.gif;*.jpg;*.jpeg'
+  if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+    try {
+      $rec = Add-Skin $dlg.FileName
+      Set-ActiveSkinId $rec.id
+      Apply-Skin $rec.id
+      Refresh-SkinPanel
+      Show-Bubble '换上新皮肤啦～' ('「' + $rec.name + '」')
+    } catch {
+      Show-Bubble '皮肤导入失败' ($_.Exception.Message)
+    }
+  }
+})
+$script:SkinWindow.Add_KeyDown({
+  param($s, $e)
+  if ($e.Key -eq 'Escape') { $script:SkinWindow.Hide() }
+})
+
+# ============================================================================
 #  提醒
 # ============================================================================
 $script:ReminderTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1807,12 +2120,12 @@ $script:App.Add_DispatcherUnhandledException({
 $script:MainWindow.Add_Loaded({
   Write-Log 'Loaded: begin'
   Save-Config
+  Apply-Skin (Get-ActiveSkinId)
   Start-IdleAnimations
   Initialize-Tray
   $script:BalanceTimer.Start()
   $script:ReminderTimer.Start()
   Write-Log 'Loaded: timers started'
-  if (-not [string]::IsNullOrWhiteSpace((Get-ApiKey))) { Refresh-Balance }
 
   $stats = Get-MemoryStats
   if ($script:FreshMemory) {
@@ -1824,6 +2137,7 @@ $script:MainWindow.Add_Loaded({
   } else {
     Show-Bubble '我回来啦～' (Get-StatusLine)
   }
+  if (-not [string]::IsNullOrWhiteSpace((Get-ApiKey))) { Refresh-Balance }
 
   Show-MissedReminders
 
@@ -1839,6 +2153,7 @@ $script:MainWindow.Add_Loaded({
   }
 
   if ($env:WHALEPET_OPEN_MEMORY -eq '1') { Show-MemoryPanel }
+  if ($env:WHALEPET_OPEN_SKINS -eq '1') { Show-SkinPanel }
   if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
     $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)
