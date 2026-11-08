@@ -345,7 +345,24 @@ function Search-Memory([string]$Query) {
   foreach ($t in @($script:Memory.todos)) {
     if ((Normalize-Key $t.text).Contains($q)) { $hits += [pscustomobject]@{ kind = 'todo'; text = $t.text } }
   }
-  return $hits
+
+  $files = @(Get-ChildItem -LiteralPath $script:SessionsDir -Filter '*.jsonl' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 90)
+  foreach ($file in $files) {
+    $date = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+    foreach ($line in @(Get-Content -LiteralPath $file.FullName -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+      if ([string]::IsNullOrWhiteSpace($line)) { continue }
+      try { $turn = $line | ConvertFrom-Json } catch { continue }
+      if (-not $turn.content) { continue }
+      if ((Normalize-Key ([string]$turn.content)).Contains($q)) {
+        $snippet = ([string]$turn.content) -replace '\s+', ' '
+        if ($snippet.Length -gt 90) { $snippet = $snippet.Substring(0, 90) + '…' }
+        $who = if ($turn.role -eq 'user') { '主人' } else { '我' }
+        $hits += [pscustomobject]@{ kind = 'turn'; text = ($date + ' ' + $who + ': ' + $snippet) }
+      }
+    }
+  }
+
+  return @($hits | Select-Object -Last 30)
 }
 
 function Get-MemoryDigest {

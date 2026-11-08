@@ -2159,6 +2159,7 @@ $script:DshTimer.Add_Tick({
     if ($run.bubble) { Set-BubbleContent $run.bubble $text }
     else { Add-ChatBubble $text 'assistant' | Out-Null }
     Speak-Reply $text
+    Add-Turn -Role 'assistant' -Content ('【DSH】' + $run.task + ' → ' + $text)
     Show-Bubble 'DSH 回来啦' ('用时 ' + $elapsed + ' 秒')
   } else {
     $msg = $stderr.Trim()

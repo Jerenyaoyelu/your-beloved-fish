@@ -74,7 +74,7 @@ function Get-ToolDefinitions {
       type     = 'function'
       function = @{
         name        = 'search_memory'
-        description = '在长期记忆里搜索关键词，不确定以前聊过什么时使用。'
+        description = '搜索长期记忆：历史对话、事实、待办、摘要。用户问以前聊过什么、查记忆、找某次任务结果时使用。'
         parameters  = @{
           type       = 'object'
           properties = @{
@@ -242,6 +242,7 @@ function Get-SystemPrompt {
   $parts += '如果用户只是问怎么做、或者你不确定他是否真的要你动手，先调用 propose_dsh 问一句确认，不要直接执行。'
   $parts += '要打开应用、网址或搜索时，调用 open_app / open_url / search_web；只能打开白名单里的应用，打不开就如实说，不要编造已经打开。需要联网查资料、读网页、总结搜索结果时，调用 browser_search / browser_read，基于返回内容回答并尽量引用标题和链接，不要凭记忆编造。'
   $parts += '硬性规则：用户只要说了「搜一下 / 查一下 / 帮我搜 / 网上查 / 搜搜看」，你必须先调用 browser_search，不许直接凭记忆回答；用户给了网址让你看，必须先调用 browser_read。基于搜索结果回答时，末尾附上 1–2 条来源链接（原样 URL）。'
+  $parts += '你确实有长期记忆：事实、待办、摘要会自动注入，历史对话可用 search_memory 检索。用户问「你还记得 / 查一下记忆 / 以前那个任务」时，先调用 search_memory，再根据结果回答；禁止回答「我没有记忆系统」或「不能跨会话查询」。'
   return ($parts -join "`r`n")
 }
 
