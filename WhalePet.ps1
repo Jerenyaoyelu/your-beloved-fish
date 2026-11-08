@@ -1017,6 +1017,7 @@ $script:Synth = $null
 $script:DshRun = $null
 $script:DshSessionId = ''
 $script:PendingDshTask = ''
+$script:PendingDshPermission = $null
 $script:VoiceProc = $null
 $script:VoiceOut = ''
 $script:VoiceListening = $false
@@ -1997,7 +1998,7 @@ function Read-DshStream($Run) {
   }
 }
 
-function Start-DshTask([string]$Task) {
+function Start-DshTask([string]$Task, [string]$ExtraDir = '') {
   $Task = ($Task -replace "`r?`n", ' ').Trim()
   if ([string]::IsNullOrWhiteSpace($Task)) { return }
   if ($script:DshRun) { Show-Bubble 'DSH 还在忙' '等这次跑完再发'; return }
@@ -2026,6 +2027,7 @@ function Start-DshTask([string]$Task) {
 
   $args = @('--expose-internals', ('"' + $paths.cliJs + '"'), 'headless', '--json')
   if ($usedSession) { $args += @('--session-id', $usedSession) }
+  if ($ExtraDir) { $args += @('--add-dir', ('"' + $ExtraDir + '"')) }
   $args += ('"' + $clean + '"')
 
   $oldNode = $env:ELECTRON_RUN_AS_NODE
@@ -2110,6 +2112,22 @@ $script:DshTimer.Add_Tick({
     if ($msg.Length -gt 800) { $msg = $msg.Substring(0, 800) + '…' }
     Add-ChatBubble ('DSH 失败：' + $msg) 'system' | Out-Null
     Show-Bubble 'DSH 没跑成功' '详情在聊天窗口'
+
+    if ($msg -match '(沙箱|sandbox|拒绝访问|access denied|outside|permission|not permitted|EACCES)') {
+      $dir = ''
+      $m = [regex]::Match($msg, '([A-Za-z]:\\[^"''\r\n]+)')
+      if ($m.Success) { $dir = $m.Groups[1].Value.Trim() }
+      if (-not $dir) {
+        if ($run.task -match '下载|Downloads') { $dir = Join-Path $env:USERPROFILE 'Downloads' }
+        elseif ($run.task -match '桌面|Desktop') { $dir = Join-Path $env:USERPROFILE 'Desktop' }
+        elseif ($run.task -match '文档|Documents') { $dir = Join-Path $env:USERPROFILE 'Documents' }
+      }
+      if ($dir) {
+        $script:PendingDshPermission = @{ task = [string]$run.task; dir = $dir }
+        Add-ChatBubble ('DSH 被沙箱拦住了：' + $dir + ' 在工作区外。要我允许这次写入并重试吗？回「要」或「不要」。') 'assistant' | Out-Null
+        Show-Bubble '需要授权' ('允许写入 ' + $dir + '？')
+      }
+    }
     if ($run.usedSession) {
       Clear-DshSession
       Add-ChatBubble '（旧会话可能失效，已重置，下次会新建一个会话）' 'system' | Out-Null
@@ -2673,6 +2691,22 @@ function Send-ChatMessage {
     Add-ChatBubble ('好，我让 DSH 去做：' + $task + '。好了告诉你。') 'assistant' | Out-Null
     Start-DshTask $task
     return
+  }
+
+  # DSH 沙箱拦截后的授权确认
+  if ($script:PendingDshPermission) {
+    $perm = $script:PendingDshPermission
+    if ($text -match '^(要|好|可以|允许|同意|行|yes|OK)[。！!]?$') {
+      $script:PendingDshPermission = $null
+      Add-ChatBubble ('好，允许写入 ' + $perm.dir + '，重试。') 'assistant' | Out-Null
+      Start-DshTask $perm.task $perm.dir
+      return
+    }
+    if ($text -match '^(不要|不用|算了|取消|不|no)[。！!]?$') {
+      $script:PendingDshPermission = $null
+      Add-ChatBubble '好，那就不写那个目录。' 'assistant' | Out-Null
+      return
+    }
   }
 
   # 模糊的工作请求：先确认（不依赖模型判断）
