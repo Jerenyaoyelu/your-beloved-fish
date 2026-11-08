@@ -22,6 +22,6 @@ SOFTWARE.
 
 ---
 
-注意：本许可仅覆盖本仓库的代码（WhalePet.ps1、start-whale-pet.vbs 等）。
-assets/whale.png 与 assets/whale.ico 派生自 dsh-whale-widget 项目的素材，
-该项目声明其 assets 目录不在 MIT 覆盖范围内，按 as-is 随插件分发。
+说明：本许可覆盖本仓库的全部内容，包括代码（WhalePet.ps1、start-whale-pet.vbs、lib/ 等）
+以及原创形象素材（assets/whale.png、assets/icon.png、assets/whale.ico）。
+形象与图标由 tools/make-art.py 生成，不包含任何第三方角色素材。

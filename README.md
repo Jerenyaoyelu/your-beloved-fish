@@ -1,5 +1,7 @@
 # 小鲸鱼桌宠（Whale Pet）v0.2
 
+<p align="center"><img src="assets/icon.png" width="140" alt="小鲸鱼"></p>
+
 一只**独立运行在 Windows 桌面上**的小鲸鱼：不需要打开 DeepSeek Harness 窗口，也能一直在屏幕角落陪着你。
 它现在是「工作助手 + 情感陪伴」的本地版本：
 
@@ -120,10 +122,9 @@ whale-pet/
 ## 八、许可与素材来源
 
 - **代码**：MIT（见 `LICENSE`）。
-- **形象素材** `assets/whale.png` / `assets/whale.ico`：来自
-  [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)
-  的 `assets/DSniang1.png`。该项目声明代码 MIT，但 `assets/` 为 as-is 提供、不在 MIT 覆盖范围；
-  使用前请自行确认素材授权。换成自己的图直接替换 `assets/whale.png` 即可。
+- **形象与图标**：原创绘制，由 [`tools/make-art.py`](tools/make-art.py) 生成（Pillow，4× 超采样 + Catmull-Rom 平滑轮廓），随项目以 MIT 授权，不再依赖任何第三方角色素材。
+- **想改形象**：直接替换 `assets/whale.png`（1024×1024 透明 PNG），或改脚本里的颜色/轮廓参数后重新运行：
+  `python tools/make-art.py`（同时生成 `assets/icon.png` 和 `assets/whale.ico`）。
 
 ## 九、和 DSH 插件的关系
 

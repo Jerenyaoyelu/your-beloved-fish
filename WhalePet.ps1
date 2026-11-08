@@ -1839,9 +1839,14 @@ $script:ChatWindow.Add_KeyDown({
 # ============================================================================
 function Initialize-Tray {
   try {
-    $bmp = New-Object System.Drawing.Bitmap($script:WhalePng)
-    $hicon = $bmp.GetHicon()
-    $script:TrayIconImage = [System.Drawing.Icon]::FromHandle($hicon)
+    $icoPath = Join-Path $script:AppDir 'assets\whale.ico'
+    if (Test-Path $icoPath) {
+      $script:TrayIconImage = New-Object System.Drawing.Icon($icoPath)
+    } else {
+      $bmp = New-Object System.Drawing.Bitmap($script:WhalePng)
+      $hicon = $bmp.GetHicon()
+      $script:TrayIconImage = [System.Drawing.Icon]::FromHandle($hicon)
+    }
     $tray = New-Object System.Windows.Forms.NotifyIcon
     $tray.Icon = $script:TrayIconImage
     $tray.Text = '小鲸鱼桌宠'
