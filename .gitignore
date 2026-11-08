@@ -1,0 +1,5 @@
+data/
+*.log
+_shot*.png
+_final.png
+_probe-screen.png
