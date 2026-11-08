@@ -19,6 +19,7 @@ os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MODEL_DIR = os.path.join(HERE, 'models', 'whisper')
+LAST = {'peak': 0.0, 'threshold': 0.0}
 
 
 def write_result(path, payload):
@@ -39,6 +40,7 @@ def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=1800):
     q = []
     noise = 300.0
     speaking = False
+    peak = 0.0
     silent_run = 0
     speech_blocks = 0
     frames = []
@@ -51,12 +53,18 @@ def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=1800):
     stream = sd.RawInputStream(samplerate=rate, blocksize=block, dtype='int16', channels=1)
     stream.start()
     try:
-        # 0.4s 环境噪声校准
-        for _ in range(13):
+        import winsound
+        winsound.Beep(880, 120)
+    except Exception:
+        pass
+    try:
+        levels = []
+        for _ in range(10):
             data, _ = stream.read(block)
             q.append(bytes(data))
-            noise = max(noise, rms(bytes(data)))
-        threshold = max(noise * 2.5, 350.0)
+            levels.append(rms(bytes(data)))
+        noise = float(np.median(levels)) if levels else 300.0
+        threshold = min(max(noise * 2.5, 350.0), 1000.0)
 
         while total < max_blocks:
             data, _ = stream.read(block)
@@ -66,6 +74,7 @@ def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=1800):
                 q.pop(0)
             total += 1
             level = rms(chunk)
+            peak = max(peak, level)
 
             if not speaking:
                 if level > threshold:
@@ -88,6 +97,8 @@ def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=1800):
         stream.stop()
         stream.close()
 
+    LAST['peak'] = round(peak, 1)
+    LAST['threshold'] = round(threshold, 1)
     if not speaking or not frames:
         return 0.0
 
@@ -129,7 +140,7 @@ def main():
             seconds = record_utterance(tmp_wav, args.wait, args.max, args.silence_ms)
             created = True
             if seconds <= 0:
-                write_result(args.out, {'ok': True, 'text': '', 'seconds': 0, 'reason': 'no_speech'})
+                write_result(args.out, {'ok': True, 'text': '', 'seconds': 0, 'reason': 'no_speech', 'peak': LAST['peak'], 'threshold': LAST['threshold']})
                 return
         print('transcribing', tmp_wav, flush=True)
         text = transcribe(tmp_wav, args.model, args.model_dir, args.device)

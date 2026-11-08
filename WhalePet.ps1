@@ -1559,6 +1559,8 @@ function Update-VoiceInput {
 
   $text = ([string]$obj.text).Trim()
   if (-not $text) {
+    $peak = if ($obj.peak) { [string]$obj.peak + ' / ' + [string]$obj.threshold } else { '?' }
+    Write-Log ('语音无输入: peak/threshold=' + $peak)
     if ($script:ConversationActive) { End-Conversation '没听到声音，先退出' }
     else { Show-Bubble '没听清…' '再说一次？' }
     return
