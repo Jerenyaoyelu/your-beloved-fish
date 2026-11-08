@@ -96,6 +96,7 @@ function New-DefaultConfig {
     lowBalanceThreshold = 5
     lastBalanceLow  = $false
     ttsEnabled      = $false
+    voiceAutoSend   = $false
     dshRoot         = ''
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
@@ -156,9 +157,10 @@ if (-not ('WhalePetWin32' -as [type])) {
 
 if (-not ('PetWin32' -as [type])) {
   Add-Type -Namespace '' -Name 'PetWin32' -MemberDefinition @'
-public class RECT { public int Left; public int Top; public int Right; public int Bottom; }
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, IntPtr lpRect);
+[DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+[DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 '@
 }
 
@@ -928,6 +930,13 @@ $script:Synth = $null
 $script:DshRun = $null
 $script:DshSessionId = ''
 $script:PendingDshTask = ''
+$script:VoiceProc = $null
+$script:VoiceOut = ''
+$script:VoiceListening = $false
+$script:VoiceHook = $null
+$script:VoiceTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:VoiceTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+$script:VoiceTimer.Add_Tick({ Update-VoiceInput })
 $script:GifFrames = @()
 $script:GifIndex = 0
 $script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1306,6 +1315,112 @@ function Speak-Reply([string]$Text) {
     $script:Synth.SpeakAsyncCancelAll()
     $script:Synth.SpeakAsync($clean) | Out-Null
   } catch { Write-Log ('TTS 失败: ' + $_.Exception.Message) }
+}
+
+# ============================================================================
+#  语音输入（Windows 中文识别，离线）
+# ============================================================================
+function Start-VoiceInput {
+  if ($script:VoiceListening) { Stop-VoiceInput; return }
+  $helper = Join-Path $script:AppDir 'tools\asr.ps1'
+  if (-not (Test-Path $helper)) { Show-Bubble '缺少语音组件' 'tools\asr.ps1 不在'; return }
+  $tmp = Join-Path $script:DataDir 'tmp'
+  if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
+  $out = Join-Path $tmp 'asr.txt'
+  Remove-Item $out -Force -ErrorAction SilentlyContinue
+  $args = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-OutPath', $out, '-Seconds', '12')
+  if ($env:WHALEPET_VOICE_WAV) { $args += @('-WavPath', $env:WHALEPET_VOICE_WAV) }
+  try {
+    $script:VoiceProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden -PassThru
+  } catch {
+    Show-Bubble '语音启动失败' ($_.Exception.Message)
+    return
+  }
+  $script:VoiceOut = $out
+  $script:VoiceListening = $true
+  Show-Bubble '我在听…' '说完停一下 · 再按 Ctrl+Alt+V 取消'
+  [void]$script:VoiceTimer.Start()
+}
+
+function Stop-VoiceInput {
+  if ($script:VoiceProc -and -not $script:VoiceProc.HasExited) {
+    try { $script:VoiceProc.Kill() } catch { }
+  }
+  $script:VoiceTimer.Stop()
+  $script:VoiceListening = $false
+  $script:VoiceProc = $null
+}
+
+function Toggle-Voice {
+  if ($script:VoiceListening) {
+    Stop-VoiceInput
+    Show-Bubble '取消啦'
+  } else {
+    Start-VoiceInput
+  }
+}
+
+function Update-VoiceInput {
+  if (-not $script:VoiceProc) { $script:VoiceTimer.Stop(); return }
+  if (-not $script:VoiceProc.HasExited) { return }
+
+  $out = $script:VoiceOut
+  $script:VoiceProc = $null
+  $script:VoiceTimer.Stop()
+  $script:VoiceListening = $false
+  Start-Sleep -Milliseconds 120
+  $text = ''
+  try {
+    if (Test-Path $out) { $text = [System.IO.File]::ReadAllText($out, [System.Text.Encoding]::UTF8) }
+  } catch { }
+  Remove-Item $out -Force -ErrorAction SilentlyContinue
+
+  if ($text -like 'ERR:*') {
+    Show-Bubble '语音识别不可用' $text.Substring(4)
+    Write-Log ('语音失败: ' + $text)
+    return
+  }
+  if ([string]::IsNullOrWhiteSpace($text)) {
+    Show-Bubble '没听清…' '再说一次？'
+    return
+  }
+
+  Show-Chat
+  $script:ChatInput.Text = $text.Trim()
+  $script:ChatPlaceholder.Visibility = 'Collapsed'
+  $script:ChatWindow.Activate()
+  $script:ChatInput.Focus() | Out-Null
+  if ($script:Config.voiceAutoSend) {
+    Send-ChatMessage
+  } else {
+    Show-Bubble '听写好了' '在输入框里，确认后回车'
+  }
+  Write-Log ('语音识别: ' + $text)
+}
+
+function Register-VoiceHotkey {
+  try {
+    $helper = New-Object System.Windows.Interop.WindowInteropHelper($script:MainWindow)
+    $hwnd = $helper.Handle
+    if (-not $hwnd -or $hwnd -eq [IntPtr]::Zero) { return }
+    $ok = [PetWin32]::RegisterHotKey($hwnd, 9001, 3, 0x56)
+    if (-not $ok) {
+      Write-Log '语音热键 Ctrl+Alt+V 注册失败（可能被占用）'
+      return
+    }
+    $source = [System.Windows.Interop.HwndSource]::FromHwnd($hwnd)
+    $script:VoiceHook = $source.AddHook({
+      param($h, $m, $w, $l, [ref]$handled)
+      if ($m -eq 0x0312 -and $w -eq 9001) {
+        $handled.Value = $true
+        Toggle-Voice
+      }
+      return [IntPtr]::Zero
+    })
+    Write-Log '语音热键已注册: Ctrl+Alt+V'
+  } catch {
+    Write-Log ('语音热键注册异常: ' + $_.Exception.Message)
+  }
 }
 
 # ============================================================================
@@ -2280,6 +2395,11 @@ function New-MenuItem([string]$Header, [scriptblock]$Action, [bool]$Checkable = 
 
 $menu = New-Object System.Windows.Controls.ContextMenu
 $miChat = New-MenuItem '和我聊天' { Show-Chat }
+$miVoice = New-MenuItem '语音输入（Ctrl+Alt+V）' { Toggle-Voice }
+$miVoiceAuto = New-MenuItem '语音自动发送' {
+  $script:Config.voiceAutoSend = [bool]$miVoiceAuto.IsChecked
+  Save-Config
+} $true ([bool]$script:Config.voiceAutoSend)
 $miMemory = New-MenuItem '记忆与设定…' { Show-MemoryPanel }
 $miTodos = New-MenuItem '我的待办' {
   $open = @(Get-OpenTodos)
@@ -2323,6 +2443,8 @@ $miFolder = New-MenuItem '打开数据文件夹' { Start-Process explorer.exe $s
 $miExit = New-MenuItem '退出' { Exit-App }
 
 $menu.Items.Add($miChat) | Out-Null
+$menu.Items.Add($miVoice) | Out-Null
+$menu.Items.Add($miVoiceAuto) | Out-Null
 $menu.Items.Add($miLook) | Out-Null
 $menu.Items.Add($miDsh) | Out-Null
 $menu.Items.Add($miDshNew) | Out-Null
@@ -2691,6 +2813,7 @@ $script:MainWindow.Add_Loaded({
   Initialize-Tts
   Start-IdleAnimations
   Initialize-Tray
+  Register-VoiceHotkey
   $script:BalanceTimer.Start()
   $script:ReminderTimer.Start()
   Write-Log 'Loaded: timers started'
@@ -2724,6 +2847,7 @@ $script:MainWindow.Add_Loaded({
   if ($env:WHALEPET_OPEN_SKINS -eq '1') { Show-SkinPanel }
   if ($env:WHALEPET_LOOK_TEST -eq '1') { Invoke-LookAtScreen }
   if ($env:WHALEPET_DSH_TEST) { Start-DshTask $env:WHALEPET_DSH_TEST }
+  if ($env:WHALEPET_VOICE_TEST -eq '1') { Start-VoiceInput }
   if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
     $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)
