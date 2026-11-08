@@ -1434,7 +1434,8 @@ function Speak-Reply([string]$Text, [switch]$Force) {
     if ($clean.Length -gt 300) { $clean = $clean.Substring(0, 300) }
     if (-not $clean) { return }
     $script:Synth.SpeakAsyncCancelAll()
-    $script:Synth.SpeakAsync($clean) | Out-Null
+    $prompt = $script:Synth.SpeakAsync($clean)
+    Write-Log ('TTS 朗读: ' + $clean.Length + ' 字, state=' + $script:Synth.State)
   } catch { Write-Log ('TTS 失败: ' + $_.Exception.Message) }
 }
 
@@ -2719,6 +2720,7 @@ $miTts = New-MenuItem '朗读回复' {
   Save-Config
   if ($miTts.IsChecked) { Speak-Reply '好的，我会把回复读出来' }
 } $true ([bool]$script:Config.ttsEnabled)
+$miTtsTest = New-MenuItem '测试语音' { Speak-Reply '这是一条测试语音，能听到我吗' -Force; Show-Bubble '测试语音' '应该能听到一句话' }
 $miWorkspace = New-MenuItem '打开工作区' { Start-Process explorer.exe $script:WorkspaceDir }
 $miRestart = New-MenuItem '重启桌宠' { Restart-App }
 $miFolder = New-MenuItem '打开数据文件夹' { Start-Process explorer.exe $script:DataDir }
@@ -2743,6 +2745,7 @@ $menu.Items.Add((New-Object System.Windows.Controls.Separator)) | Out-Null
 $menu.Items.Add($miSettings) | Out-Null
 $menu.Items.Add($miSkin) | Out-Null
 $menu.Items.Add($miTts) | Out-Null
+$menu.Items.Add($miTtsTest) | Out-Null
 $menu.Items.Add($miWorkspace) | Out-Null
 $menu.Items.Add($miRestart) | Out-Null
 $menu.Items.Add($miFolder) | Out-Null
@@ -3134,6 +3137,7 @@ $script:MainWindow.Add_Loaded({
   if ($env:WHALEPET_DSH_TEST) { Start-DshTask $env:WHALEPET_DSH_TEST }
   if ($env:WHALEPET_VOICE_TEST -eq '1') { Start-VoiceInput }
   if ($env:WHALEPET_WAKE_TEST -eq '1') { Start-WakeListener }
+  if ($env:WHALEPET_TTS_TEST -eq '1') { Speak-Reply '测试语音，能听到我吗' -Force }
   if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
     $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)
