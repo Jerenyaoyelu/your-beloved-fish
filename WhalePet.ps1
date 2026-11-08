@@ -97,6 +97,8 @@ function New-DefaultConfig {
     lastBalanceLow  = $false
     ttsEnabled      = $false
     voiceAutoSend   = $false
+    voiceWakeEnabled = $false
+    voiceWakeWord   = '小鲸鱼'
     dshRoot         = ''
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
@@ -790,6 +792,88 @@ $xamlDsh = @'
 '@
 
 # ============================================================================
+#  XAML — 唤醒词
+# ============================================================================
+$xamlWake = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="唤醒词" Width="460" Height="300"
+        WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" FontFamily="Microsoft YaHei UI">
+  <Window.Resources>
+    <Style x:Key="PrimaryBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#2F7CF6" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#1E6BE6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="GhostBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#5B6B7F"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#EEF3FA" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#E3EBF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Border CornerRadius="20" Background="#FFFDFB" BorderBrush="#E6EDF7"
+          BorderThickness="1" Margin="12">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="30" ShadowDepth="5" Opacity="0.24" Color="#12203A"/>
+    </Border.Effect>
+    <Grid Margin="22,18,22,16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <TextBlock Grid.Row="0" Text="唤醒词" FontSize="17" FontWeight="SemiBold" Foreground="#17202B"/>
+      <TextBlock Grid.Row="1" Text="对着麦克风说这个词，进入语音对话模式；可以用任何短语，比如「小鲸鱼」「嘿小蓝」。"
+                 FontSize="11.5" Foreground="#8A97A8" Margin="0,6,0,0" TextWrapping="Wrap"/>
+
+      <TextBox x:Name="WakeInput" Grid.Row="2" Margin="0,14,0,0" Height="38" FontSize="14"
+               VerticalContentAlignment="Center" Padding="10,6"
+               Background="#F8FAFD" BorderBrush="#E3EBF5" BorderThickness="1" Foreground="#17202B"/>
+
+      <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+        <Button x:Name="WakeCancel" Content="取消" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+        <Button x:Name="WakeSave" Content="保存" Style="{StaticResource PrimaryBtn}"/>
+      </StackPanel>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+# ============================================================================
 #  XAML — 设置窗口
 # ============================================================================
 $xamlSettings = @'
@@ -937,6 +1021,43 @@ $script:VoiceHook = $null
 $script:VoiceTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:VoiceTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $script:VoiceTimer.Add_Tick({ Update-VoiceInput })
+$script:ConversationActive = $false
+$script:WakeProc = $null
+$script:WakeMarker = ''
+$script:WakeTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WakeTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+$script:WakeTimer.Add_Tick({
+  if (-not $script:WakeProc) { $script:WakeTimer.Stop(); return }
+  if ($script:WakeMarker -and (Test-Path $script:WakeMarker)) {
+    $txt = ''
+    try { $txt = [System.IO.File]::ReadAllText($script:WakeMarker, [System.Text.Encoding]::UTF8) } catch { }
+    Remove-Item $script:WakeMarker -Force -ErrorAction SilentlyContinue
+    Stop-WakeListener
+    if ($txt -like 'ERR:*') {
+      Write-Log ('唤醒失败: ' + $txt)
+      Show-Bubble '语音唤醒不可用' $txt.Substring(4)
+      return
+    }
+    Write-Log ('唤醒词命中: ' + $txt)
+    Start-Conversation
+    return
+  }
+  if ($script:WakeProc.HasExited) {
+    $script:WakeProc = $null
+    $script:WakeTimer.Stop()
+    if ($script:Config.voiceWakeEnabled -and -not $script:ConversationActive) {
+      $script:WakeRetryTimer.Start()
+    }
+  }
+})
+$script:WakeRetryTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:WakeRetryTimer.Interval = [TimeSpan]::FromSeconds(3)
+$script:WakeRetryTimer.Add_Tick({
+  $script:WakeRetryTimer.Stop()
+  if ($script:Config.voiceWakeEnabled -and -not $script:ConversationActive -and -not $script:WakeProc) {
+    Start-WakeListener
+  }
+})
 $script:GifFrames = @()
 $script:GifIndex = 0
 $script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1318,27 +1439,67 @@ function Speak-Reply([string]$Text) {
 }
 
 # ============================================================================
-#  语音输入（Windows 中文识别，离线）
+#  语音：Whisper 转写 + 唤醒词 + 语音对话
 # ============================================================================
+function Get-VoicePython {
+  $p = Join-Path $script:AppDir 'voice\.venv\Scripts\python.exe'
+  if (Test-Path $p) { return $p }
+  return ''
+}
+
+function Get-WhisperModelPath {
+  $snapRoot = Join-Path $script:AppDir 'voice\models\whisper\models--Systran--faster-whisper-small\snapshots'
+  if (Test-Path $snapRoot) {
+    $d = Get-ChildItem $snapRoot -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($d) { return $d.FullName }
+  }
+  return ''
+}
+
+function Wait-Speech([int]$MaxSeconds = 15) {
+  if (-not $script:Synth) { return }
+  $deadline = (Get-Date).AddSeconds($MaxSeconds)
+  while ($script:Synth.State -ne 'Ready' -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 150
+  }
+}
+
 function Start-VoiceInput {
-  if ($script:VoiceListening) { Stop-VoiceInput; return }
-  $helper = Join-Path $script:AppDir 'tools\asr.ps1'
-  if (-not (Test-Path $helper)) { Show-Bubble '缺少语音组件' 'tools\asr.ps1 不在'; return }
+  param([switch]$Conversation)
+  if ($script:VoiceListening) { return }
+
+  $py = Get-VoicePython
+  $model = Get-WhisperModelPath
+  Write-Log ('语音启动: py=' + $py + ' model=' + $model)
+  if (-not $py -or -not $model) {
+    Show-Bubble '语音组件没装好' '需要 voice\.venv 和 Whisper 模型'
+    return
+  }
+
   $tmp = Join-Path $script:DataDir 'tmp'
   if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
-  $out = Join-Path $tmp 'asr.txt'
+  $out = Join-Path $tmp 'voice.json'
   Remove-Item $out -Force -ErrorAction SilentlyContinue
-  $args = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $helper, '-OutPath', $out, '-Seconds', '12')
-  if ($env:WHALEPET_VOICE_WAV) { $args += @('-WavPath', $env:WHALEPET_VOICE_WAV) }
+
+  $maxSec = if ($Conversation) { 60 } else { 60 }
+  $waitSec = if ($Conversation) { 30 } else { 20 }
+  $args = @((Join-Path $script:AppDir 'voice\utterance.py'), '--out', $out, '--max', "$maxSec", '--wait', "$waitSec", '--model', $model, '--device', 'cpu')
+  if ($env:WHALEPET_VOICE_WAV) { $args += @('--wav', $env:WHALEPET_VOICE_WAV) }
+
   try {
-    $script:VoiceProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $args -WindowStyle Hidden -PassThru
+    $script:VoiceProc = Start-Process -FilePath $py -ArgumentList $args -WindowStyle Hidden -PassThru
+    Write-Log ('语音进程 pid=' + $script:VoiceProc.Id)
   } catch {
     Show-Bubble '语音启动失败' ($_.Exception.Message)
     return
   }
   $script:VoiceOut = $out
   $script:VoiceListening = $true
-  Show-Bubble '我在听…' '说完停一下 · 再按 Ctrl+Alt+V 取消'
+  if ($Conversation) {
+    Show-Bubble '我在听…' '说完停一下；说「再见」结束'
+  } else {
+    Show-Bubble '我在听…' '说完停一下 · 再按 Ctrl+Alt+V 取消'
+  }
   [void]$script:VoiceTimer.Start()
 }
 
@@ -1369,24 +1530,43 @@ function Update-VoiceInput {
   $script:VoiceTimer.Stop()
   $script:VoiceListening = $false
   Start-Sleep -Milliseconds 120
-  $text = ''
+
+  $obj = $null
   try {
-    if (Test-Path $out) { $text = [System.IO.File]::ReadAllText($out, [System.Text.Encoding]::UTF8) }
+    if (Test-Path $out) { $obj = Get-Content $out -Raw -Encoding UTF8 | ConvertFrom-Json }
   } catch { }
   Remove-Item $out -Force -ErrorAction SilentlyContinue
 
-  if ($text -like 'ERR:*') {
-    Show-Bubble '语音识别不可用' $text.Substring(4)
-    Write-Log ('语音失败: ' + $text)
+  if (-not $obj -or -not $obj.ok) {
+    $err = if ($obj -and $obj.error) { [string]$obj.error } else { '没有返回结果' }
+    Show-Bubble '语音识别失败' $err
+    Write-Log ('语音失败: ' + $err)
+    if ($script:ConversationActive) { End-Conversation }
     return
   }
-  if ([string]::IsNullOrWhiteSpace($text)) {
-    Show-Bubble '没听清…' '再说一次？'
+
+  $text = ([string]$obj.text).Trim()
+  if (-not $text) {
+    if ($script:ConversationActive) { End-Conversation '没听到声音，先退出' }
+    else { Show-Bubble '没听清…' '再说一次？' }
+    return
+  }
+
+  if ($text -match '^(再见|拜拜|退出|不聊了|结束|停止)[。！!]?$') {
+    if ($script:ConversationActive) { End-Conversation '好，再见' }
+    else { Show-Bubble '好～' }
+    return
+  }
+
+  if ($script:ConversationActive) {
+    Add-ChatBubble $text 'user' | Out-Null
+    $script:ChatInput.Text = $text
+    Send-ChatMessage
     return
   }
 
   Show-Chat
-  $script:ChatInput.Text = $text.Trim()
+  $script:ChatInput.Text = $text
   $script:ChatPlaceholder.Visibility = 'Collapsed'
   $script:ChatWindow.Activate()
   $script:ChatInput.Focus() | Out-Null
@@ -1396,6 +1576,91 @@ function Update-VoiceInput {
     Show-Bubble '听写好了' '在输入框里，确认后回车'
   }
   Write-Log ('语音识别: ' + $text)
+}
+
+# ---------------------------------------------------------------- 对话模式
+function Start-Conversation {
+  if ($script:ConversationActive) { return }
+  $script:ConversationActive = $true
+  Stop-WakeListener
+  Speak-Reply '我在呢，你说'
+  Show-Bubble '我在呢' '直接说；30 秒没声音或说「再见」就退出'
+  Wait-Speech
+  Start-VoiceInput -Conversation
+}
+
+function End-Conversation([string]$Why = '') {
+  if (-not $script:ConversationActive) { return }
+  $script:ConversationActive = $false
+  if ($script:Synth) { try { $script:Synth.SpeakAsyncCancelAll() } catch { } }
+  Show-Bubble '先聊到这' $(if ($Why) { $Why } else { '叫我就行' })
+  if ($script:Config.voiceWakeEnabled) { Start-WakeListener }
+}
+
+# ---------------------------------------------------------------- 唤醒词
+function Start-WakeListener {
+  if (-not $script:Config.voiceWakeEnabled -and -not $env:WHALEPET_WAKE_TEST) { return }
+  if ($script:WakeProc) { return }
+  if ($script:ConversationActive) { return }
+
+  $wake = Join-Path $script:AppDir 'tools\wake.ps1'
+  if (-not (Test-Path $wake)) { Write-Log '缺少 tools\wake.ps1'; return }
+  $tmp = Join-Path $script:DataDir 'tmp'
+  if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
+  $marker = Join-Path $tmp 'wake.txt'
+  Remove-Item $marker -Force -ErrorAction SilentlyContinue
+  $word = [string]$script:Config.voiceWakeWord
+  if ([string]::IsNullOrWhiteSpace($word)) { $word = '小鲸鱼' }
+
+  try {
+    $wargs = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $wake, '-WakeWord', $word, '-OutFile', $marker, '-Seconds', '3600')
+    if ($env:WHALEPET_WAKE_WAV) { $wargs += @('-WavPath', $env:WHALEPET_WAKE_WAV) }
+    $script:WakeProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $wargs -WindowStyle Hidden -PassThru
+    $script:WakeMarker = $marker
+    [void]$script:WakeTimer.Start()
+    Write-Log ('唤醒监听已启动: ' + $word)
+  } catch {
+    Write-Log ('唤醒监听启动失败: ' + $_.Exception.Message)
+  }
+}
+
+function Stop-WakeListener {
+  if ($script:WakeProc -and -not $script:WakeProc.HasExited) {
+    try { $script:WakeProc.Kill() } catch { }
+  }
+  $script:WakeProc = $null
+  $script:WakeTimer.Stop()
+}
+
+function Show-WakeWordDialog {
+  $dlg = New-WindowFromXaml $xamlWake
+  $dlg.Topmost = $true
+  if ($script:MainWindow.IsVisible) { $dlg.Owner = $script:MainWindow }
+  $box = $dlg.FindName('WakeInput')
+  $save = $dlg.FindName('WakeSave')
+  $cancel = $dlg.FindName('WakeCancel')
+  $box.Text = [string]$script:Config.voiceWakeWord
+  $script:WakeDialog = $dlg
+  $script:WakeInputBox = $box
+
+  $cancel.Add_Click({ $script:WakeDialog.Close() })
+  $save.Add_Click({
+    $w = ($script:WakeInputBox.Text).Trim()
+    if ([string]::IsNullOrWhiteSpace($w)) { return }
+    $script:Config.voiceWakeWord = $w
+    Save-Config
+    $script:WakeDialog.Close()
+    if ($script:Config.voiceWakeEnabled) {
+      Stop-WakeListener
+      Start-WakeListener
+    }
+    Show-Bubble ('唤醒词改成「' + $w + '」') '叫我试试'
+  })
+  $dlg.Add_KeyDown({
+    param($s, $e)
+    if ($e.Key -eq 'Escape') { $script:WakeDialog.Close() }
+  })
+  $dlg.ShowDialog() | Out-Null
 }
 
 function Register-VoiceHotkey {
@@ -1929,6 +2194,10 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   Remove-ChatPlaceholder
   Add-ChatBubble $reply 'assistant' | Out-Null
   Speak-Reply $reply
+  if ($script:ConversationActive) {
+    Wait-Speech
+    if ($script:ConversationActive) { Start-VoiceInput -Conversation }
+  }
   Set-ChatBusy $false
   $script:ChatCtx = $null
 
@@ -2400,6 +2669,12 @@ $miVoiceAuto = New-MenuItem '语音自动发送' {
   $script:Config.voiceAutoSend = [bool]$miVoiceAuto.IsChecked
   Save-Config
 } $true ([bool]$script:Config.voiceAutoSend)
+$miVoiceWake = New-MenuItem '语音唤醒（叫名字）' {
+  $script:Config.voiceWakeEnabled = [bool]$miVoiceWake.IsChecked
+  Save-Config
+  if ($miVoiceWake.IsChecked) { Start-WakeListener; Show-Bubble '好，叫我名字就行' ('唤醒词：' + $script:Config.voiceWakeWord) } else { Stop-WakeListener; Show-Bubble '已关闭语音唤醒' }
+} $true ([bool]$script:Config.voiceWakeEnabled)
+$miWakeWord = New-MenuItem '设置唤醒词…' { Show-WakeWordDialog }
 $miMemory = New-MenuItem '记忆与设定…' { Show-MemoryPanel }
 $miTodos = New-MenuItem '我的待办' {
   $open = @(Get-OpenTodos)
@@ -2445,6 +2720,8 @@ $miExit = New-MenuItem '退出' { Exit-App }
 $menu.Items.Add($miChat) | Out-Null
 $menu.Items.Add($miVoice) | Out-Null
 $menu.Items.Add($miVoiceAuto) | Out-Null
+$menu.Items.Add($miVoiceWake) | Out-Null
+$menu.Items.Add($miWakeWord) | Out-Null
 $menu.Items.Add($miLook) | Out-Null
 $menu.Items.Add($miDsh) | Out-Null
 $menu.Items.Add($miDshNew) | Out-Null
@@ -2814,6 +3091,7 @@ $script:MainWindow.Add_Loaded({
   Start-IdleAnimations
   Initialize-Tray
   Register-VoiceHotkey
+  Start-WakeListener
   $script:BalanceTimer.Start()
   $script:ReminderTimer.Start()
   Write-Log 'Loaded: timers started'
@@ -2848,6 +3126,7 @@ $script:MainWindow.Add_Loaded({
   if ($env:WHALEPET_LOOK_TEST -eq '1') { Invoke-LookAtScreen }
   if ($env:WHALEPET_DSH_TEST) { Start-DshTask $env:WHALEPET_DSH_TEST }
   if ($env:WHALEPET_VOICE_TEST -eq '1') { Start-VoiceInput }
+  if ($env:WHALEPET_WAKE_TEST -eq '1') { Start-WakeListener }
   if ($env:WHALEPET_OPEN_CHAT -eq '1' -or $env:WHALEPET_SEND_TEST) {
     $script:AutoTimer = New-Object System.Windows.Threading.DispatcherTimer
     $script:AutoTimer.Interval = [TimeSpan]::FromMilliseconds(800)

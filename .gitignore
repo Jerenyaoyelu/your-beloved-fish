@@ -1,5 +1,10 @@
-data/
+﻿data/
 *.log
 _shot*.png
 _final.png
 _probe-screen.png
+voice/.venv/
+voice/models/
+voice/__pycache__/
+voice/_dl.py
+voice/_t.py
