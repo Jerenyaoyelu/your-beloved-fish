@@ -1027,6 +1027,7 @@ $script:VoiceTimer.Add_Tick({ Update-VoiceInput })
 $script:ConversationActive = $false
 $script:VoiceBuffer = ''
 $script:VoiceExtend = 0
+$script:VoiceRetry = 0
 $script:WakeProc = $null
 $script:WakeMarker = ''
 $script:WakeTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1747,8 +1748,15 @@ function Update-VoiceInput {
     $peak = if ($obj.peak) { [string]$obj.peak + ' / ' + [string]$obj.threshold } else { '?' }
     Write-Log ('语音无输入: peak/threshold=' + $peak)
     Set-ChatStatus ''
-    if ($script:ConversationActive) { End-Conversation '没听到声音，先退出' }
-    else { Show-Bubble '没听清…' '再说一次？' }
+    if ($script:ConversationActive) {
+      if ($script:VoiceRetry -lt 1) {
+        $script:VoiceRetry++
+        Show-Bubble '我没听清…' '再说一次？'
+        Start-VoiceInput -Conversation
+        return
+      }
+      End-Conversation '没听到声音，先退出'
+    } else { Show-Bubble '没听清…' '再说一次？' }
     return
   }
 
@@ -1773,6 +1781,7 @@ function Update-VoiceInput {
     if ($script:VoiceBuffer) { $text = ($script:VoiceBuffer + ' ' + $text).Trim() }
     $script:VoiceBuffer = ''
     $script:VoiceExtend = 0
+    $script:VoiceRetry = 0
     Write-Log ('语音识别: ' + $text)
     Set-ChatStatus '🤔 正在想…'
     $script:ChatInput.Text = $text
@@ -1797,6 +1806,7 @@ function Update-VoiceInput {
 function Start-Conversation {
   if ($script:ConversationActive) { return }
   $script:ConversationActive = $true
+  $script:VoiceRetry = 0
   Stop-WakeListener
   Show-Chat
   Speak-Reply '我在呢，你说' -Force
@@ -1810,6 +1820,7 @@ function End-Conversation([string]$Why = '') {
   $script:ConversationActive = $false
 $script:VoiceBuffer = ''
 $script:VoiceExtend = 0
+$script:VoiceRetry = 0
   if ($script:Synth) { try { $script:Synth.SpeakAsyncCancelAll() } catch { } }
   Show-Bubble '先聊到这' $(if ($Why) { $Why } else { '叫我就行' })
   if ($script:Config.voiceWakeEnabled) { Start-WakeListener }

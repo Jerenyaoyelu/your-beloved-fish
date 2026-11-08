@@ -64,7 +64,7 @@ def record_utterance(path, wait_seconds=20, max_seconds=60, silence_ms=1800):
             q.append(bytes(data))
             levels.append(rms(bytes(data)))
         noise = float(np.median(levels)) if levels else 300.0
-        threshold = min(max(noise * 2.5, 350.0), 1000.0)
+        threshold = min(max(noise * 1.8, 220.0), 600.0)
 
         while total < max_blocks:
             data, _ = stream.read(block)
