@@ -2273,6 +2273,40 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
         Show-Bubble '要交给 DSH 吗？' $q | Out-Null
         return (@{ ok = $true; status = 'awaiting_user'; question = $q; note = '已向用户确认，等待回复；不要声称已执行' } | ConvertTo-Json -Compress)
       }
+      'open_app' {
+        $name = [string]$a['name']
+        $target = Resolve-OpenTarget $name
+        if (-not $target) {
+          return (@{ ok = $false; reason = ('不在白名单：' + $name); available = @($script:OpenAppMap.Keys) } | ConvertTo-Json -Compress)
+        }
+        $r = Invoke-OpenTarget $target
+        return (@{ ok = $r.ok; message = $r.message } | ConvertTo-Json -Compress)
+      }
+      'open_url' {
+        $u = [string]$a['url']
+        if ($u -notmatch '^https?://') {
+          return (@{ ok = $false; reason = '只支持 http/https 网址' } | ConvertTo-Json -Compress)
+        }
+        try {
+          Start-Process $u | Out-Null
+          return (@{ ok = $true; message = ('打开网址啦：' + $u) } | ConvertTo-Json -Compress)
+        } catch {
+          return (@{ ok = $false; reason = $_.Exception.Message } | ConvertTo-Json -Compress)
+        }
+      }
+      'search_web' {
+        $q = [string]$a['query']
+        if ([string]::IsNullOrWhiteSpace($q)) {
+          return (@{ ok = $false; reason = '关键词为空' } | ConvertTo-Json -Compress)
+        }
+        $url = 'https://www.baidu.com/s?wd=' + [uri]::EscapeDataString($q)
+        try {
+          Start-Process $url | Out-Null
+          return (@{ ok = $true; message = ('搜「' + $q + '」啦') } | ConvertTo-Json -Compress)
+        } catch {
+          return (@{ ok = $false; reason = $_.Exception.Message } | ConvertTo-Json -Compress)
+        }
+      }
       'delegate_to_dsh' {
         $script:PendingDshTask = ''
         $task = [string]$a['task']
@@ -2453,6 +2487,85 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   Refresh-MemoryPanel
 }
 
+# ============================================================================
+#  本地快捷动作：打开应用 / 网站 / 搜索
+# ============================================================================
+$script:OpenSiteMap = [ordered]@{
+  'b站' = 'https://www.bilibili.com'; 'bilibili' = 'https://www.bilibili.com'
+  '百度' = 'https://www.baidu.com'; '知乎' = 'https://www.zhihu.com'
+  '微博' = 'https://weibo.com'; '淘宝' = 'https://www.taobao.com'
+  '京东' = 'https://www.jd.com'; 'github' = 'https://github.com'
+  'youtube' = 'https://www.youtube.com'; '网易云' = 'https://music.163.com'
+}
+$script:OpenAppMap = [ordered]@{
+  '浏览器' = @('url', 'https://www.bing.com'); 'browser' = @('url', 'https://www.bing.com')
+  '记事本' = @('exe', 'notepad.exe'); 'notepad' = @('exe', 'notepad.exe')
+  '计算器' = @('exe', 'calc.exe')
+  '资源管理器' = @('exe', 'explorer.exe'); '文件管理器' = @('exe', 'explorer.exe')
+  '任务管理器' = @('exe', 'taskmgr.exe')
+  '画图' = @('exe', 'mspaint.exe')
+  '截图' = @('exe', 'snippingtool.exe')
+  '终端' = @('exe', 'wt.exe'); 'powershell' = @('exe', 'powershell.exe')
+  '设置' = @('url', 'ms-settings:')
+}
+
+function Resolve-OpenTarget([string]$Name) {
+  $n = ($Name.Trim().ToLower()) -replace '\s+', ''
+  if (-not $n) { return $null }
+  foreach ($k in $script:OpenSiteMap.Keys) {
+    if ($n -eq $k -or $n.Contains($k)) {
+      return @{ kind = 'url'; target = $script:OpenSiteMap[$k]; label = $k }
+    }
+  }
+  foreach ($k in $script:OpenAppMap.Keys) {
+    if ($n -eq $k -or $n.Contains($k)) {
+      $v = $script:OpenAppMap[$k]
+      $label = if ($k -eq 'browser') { '浏览器' } else { $k }
+      return @{ kind = $v[0]; target = $v[1]; label = $label }
+    }
+  }
+  return $null
+}
+
+function Invoke-OpenTarget($Target) {
+  try {
+    if ($Target.kind -eq 'url') {
+      Start-Process $Target.target | Out-Null
+    } else {
+      Start-Process -FilePath $Target.target -ErrorAction Stop | Out-Null
+    }
+    Set-ChatStatus '🚀 打开中…'
+    Show-Bubble ('打开' + $Target.label + '啦') '还需要什么？'
+    return @{ ok = $true; message = ('打开' + $Target.label + '啦') }
+  } catch {
+    return @{ ok = $false; message = ('没打开：' + $_.Exception.Message) }
+  }
+}
+
+function Try-QuickAction([string]$Text) {
+  $t = $Text.Trim()
+  if ($t -match '^(?:请|帮我|麻烦你?|给我)?\s*(?:打开|启动|开启|开一下|开个)\s*(.+)$') {
+    $target = Resolve-OpenTarget $Matches[1]
+    if ($target) { return (Invoke-OpenTarget $target) }
+    return $null
+  }
+  if ($t -match '^(?:帮我|请)?\s*(?:搜一下|搜索一下|搜索|查一下|查查|百度一下)\s*(.+)$') {
+    $q = $Matches[1].Trim()
+    if ($q) {
+      $url = 'https://www.baidu.com/s?wd=' + [uri]::EscapeDataString($q)
+      try {
+        Start-Process $url | Out-Null
+        Set-ChatStatus '🔎 搜索中…'
+        Show-Bubble '帮你搜啦' ('关键词：' + $q)
+        return @{ ok = $true; message = ('搜「' + $q + '」啦，在浏览器里') }
+      } catch {
+        return @{ ok = $false; message = ('搜索没打开：' + $_.Exception.Message) }
+      }
+    }
+  }
+  return $null
+}
+
 function Send-ChatMessage {
   if ($script:ChatBusy) { return }
   $text = $script:ChatInput.Text
@@ -2492,6 +2605,17 @@ function Send-ChatMessage {
       Add-ChatBubble '好，那我不动它。' 'assistant' | Out-Null
       return
     }
+  }
+  $quick = Try-QuickAction $text
+  if ($quick) {
+    Set-ChatStatus ''
+    Add-ChatBubble $quick.message 'assistant' | Out-Null
+    Speak-Reply $quick.message
+    if ($script:ConversationActive) {
+      Wait-Speech
+      if ($script:ConversationActive) { Start-VoiceInput -Conversation }
+    }
+    return
   }
 
   Set-ChatStatus '🤔 正在想…'

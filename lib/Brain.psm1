@@ -130,6 +130,48 @@ function Get-ToolDefinitions {
     @{
       type     = 'function'
       function = @{
+        name        = 'open_app'
+        description = '打开本机白名单里的应用或网站。用户说“打开浏览器/打开记事本/打开B站”时调用。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            name = @{ type = 'string'; description = '应用或网站名，如 浏览器、记事本、计算器、B站、知乎' }
+          }
+          required   = @('name')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
+        name        = 'open_url'
+        description = '用默认浏览器打开一个 http/https 网址。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            url = @{ type = 'string'; description = '完整网址' }
+          }
+          required   = @('url')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
+        name        = 'search_web'
+        description = '在百度搜索一个关键词并打开浏览器。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            query = @{ type = 'string'; description = '搜索关键词' }
+          }
+          required   = @('query')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
         name        = 'delegate_to_dsh'
         description = '把需要实际执行的工作任务（读写文件、跑命令、查代码、调研、多步骤操作）交给本机 DSH 处理。闲聊、情感陪伴、简单问答不要调用。调用后任务在后台执行，结果会自动发到聊天；回复时只说已交给 DSH，不要声称已完成。'
         parameters  = @{
@@ -169,6 +211,7 @@ function Get-SystemPrompt {
   $parts += '工具规则：用户让你记待办/设提醒/记住事实时，先调用对应工具，再简短确认；不要假装已经记住。'
   $parts += '工作规则：凡是需要实际动手的任务（读写文件、跑命令、查代码、调研、多步骤操作），必须调用 delegate_to_dsh 交给本机 DSH 执行，不要自己假装完成，也不要只给建议；闲聊、情感陪伴、简单问答不要调用。调用后只回复「已经交给 DSH，完成后告诉你」，绝对不要声称任务已完成或编造结果——结果会在几秒后自动出现在聊天里。'
   $parts += '如果用户只是问怎么做、或者你不确定他是否真的要你动手，先调用 propose_dsh 问一句确认，不要直接执行。'
+  $parts += '要打开应用、网址或搜索时，调用 open_app / open_url / search_web；只能打开白名单里的应用，打不开就如实说，不要编造已经打开。'
   return ($parts -join "`r`n")
 }
 
