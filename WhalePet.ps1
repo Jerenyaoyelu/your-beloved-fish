@@ -1425,8 +1425,8 @@ function Initialize-Tts {
   }
 }
 
-function Speak-Reply([string]$Text) {
-  if (-not $script:Config.ttsEnabled) { return }
+function Speak-Reply([string]$Text, [switch]$Force) {
+  if (-not $script:Config.ttsEnabled -and -not $Force) { return }
   if (-not $script:Synth) { return }
   try {
     $clean = ($Text -replace '[*_#>`~]', '') -replace '\s+', ' '
@@ -1487,7 +1487,13 @@ function Start-VoiceInput {
   if ($env:WHALEPET_VOICE_WAV) { $args += @('--wav', $env:WHALEPET_VOICE_WAV) }
 
   try {
-    $script:VoiceProc = Start-Process -FilePath $py -ArgumentList $args -WindowStyle Hidden -PassThru
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $py
+    $psi.Arguments = (($args | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = $script:AppDir
+    $script:VoiceProc = [System.Diagnostics.Process]::Start($psi)
     Write-Log ('语音进程 pid=' + $script:VoiceProc.Id)
   } catch {
     Show-Bubble '语音启动失败' ($_.Exception.Message)
@@ -1559,7 +1565,7 @@ function Update-VoiceInput {
   }
 
   if ($script:ConversationActive) {
-    Add-ChatBubble $text 'user' | Out-Null
+    Write-Log ('语音识别: ' + $text)
     $script:ChatInput.Text = $text
     Send-ChatMessage
     return
@@ -1583,7 +1589,8 @@ function Start-Conversation {
   if ($script:ConversationActive) { return }
   $script:ConversationActive = $true
   Stop-WakeListener
-  Speak-Reply '我在呢，你说'
+  Show-Chat
+  Speak-Reply '我在呢，你说' -Force
   Show-Bubble '我在呢' '直接说；30 秒没声音或说「再见」就退出'
   Wait-Speech
   Start-VoiceInput -Conversation
@@ -2193,7 +2200,7 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   if ([string]::IsNullOrWhiteSpace($reply)) { $reply = '（这次没想出话来说…）' }
   Remove-ChatPlaceholder
   Add-ChatBubble $reply 'assistant' | Out-Null
-  Speak-Reply $reply
+  Speak-Reply $reply -Force:$script:ConversationActive
   if ($script:ConversationActive) {
     Wait-Speech
     if ($script:ConversationActive) { Start-VoiceInput -Conversation }
@@ -2672,7 +2679,7 @@ $miVoiceAuto = New-MenuItem '语音自动发送' {
 $miVoiceWake = New-MenuItem '语音唤醒（叫名字）' {
   $script:Config.voiceWakeEnabled = [bool]$miVoiceWake.IsChecked
   Save-Config
-  if ($miVoiceWake.IsChecked) { Start-WakeListener; Show-Bubble '好，叫我名字就行' ('唤醒词：' + $script:Config.voiceWakeWord) } else { Stop-WakeListener; Show-Bubble '已关闭语音唤醒' }
+  if ($miVoiceWake.IsChecked) { if (-not $script:Config.ttsEnabled) { $script:Config.ttsEnabled = $true; Save-Config }; Start-WakeListener; Show-Bubble '好，叫我名字就行' ('唤醒词：' + $script:Config.voiceWakeWord + ' · 已开启语音回复') } else { Stop-WakeListener; Show-Bubble '已关闭语音唤醒' }
 } $true ([bool]$script:Config.voiceWakeEnabled)
 $miWakeWord = New-MenuItem '设置唤醒词…' { Show-WakeWordDialog }
 $miMemory = New-MenuItem '记忆与设定…' { Show-MemoryPanel }
