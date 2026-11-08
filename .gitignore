@@ -8,3 +8,4 @@ voice/models/
 voice/__pycache__/
 voice/_dl.py
 voice/_t.py
+voice/data/

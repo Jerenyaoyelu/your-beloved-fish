@@ -2273,6 +2273,35 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
         Show-Bubble '要交给 DSH 吗？' $q | Out-Null
         return (@{ ok = $true; status = 'awaiting_user'; question = $q; note = '已向用户确认，等待回复；不要声称已执行' } | ConvertTo-Json -Compress)
       }
+      'browser_search' {
+        $q = [string]$a['query']
+        $lim = 5
+        try { if ($a['limit']) { $lim = [int]$a['limit'] } } catch { }
+        if ([string]::IsNullOrWhiteSpace($q)) {
+          return (@{ ok = $false; reason = '缺少搜索关键词' } | ConvertTo-Json -Compress)
+        }
+        Set-ChatStatus '🔎 正在查资料…'
+        $r = Invoke-BrowserTask 'search' $q '' $lim
+        Set-ChatStatus ''
+        if (-not $r.ok) {
+          return (@{ ok = $false; reason = [string]$r.error } | ConvertTo-Json -Compress)
+        }
+        $items = @($r.results | Select-Object -First $lim)
+        return (@{ ok = $true; engine = $r.engine; results = $items } | ConvertTo-Json -Depth 5 -Compress)
+      }
+      'browser_read' {
+        $u = [string]$a['url']
+        if ($u -notmatch '^https?://') {
+          return (@{ ok = $false; reason = '只支持 http/https 网址' } | ConvertTo-Json -Compress)
+        }
+        Set-ChatStatus '📄 正在读页面…'
+        $r = Invoke-BrowserTask 'read' '' $u 3 3500
+        Set-ChatStatus ''
+        if (-not $r.ok) {
+          return (@{ ok = $false; reason = [string]$r.error } | ConvertTo-Json -Compress)
+        }
+        return (@{ ok = $true; title = $r.title; url = $r.url; text = $r.text } | ConvertTo-Json -Compress)
+      }
       'open_app' {
         $name = [string]$a['name']
         $target = Resolve-OpenTarget $name
@@ -2551,6 +2580,7 @@ function Try-QuickAction([string]$Text) {
   }
   if ($t -match '^(?:帮我|请)?\s*(?:搜一下|搜索一下|搜索|查一下|查查|百度一下)\s*(.+)$') {
     $q = $Matches[1].Trim()
+    if ($q -match '(总结|念|告诉|说给|前几|读|列|是什么|怎么样|介绍|讲讲|对比|区别)') { return $null }
     if ($q) {
       $url = 'https://www.baidu.com/s?wd=' + [uri]::EscapeDataString($q)
       try {
@@ -2564,6 +2594,57 @@ function Try-QuickAction([string]$Text) {
     }
   }
   return $null
+}
+
+function Invoke-BrowserTask([string]$Action, [string]$Query, [string]$Url, [int]$Limit = 5, [int]$MaxChars = 3500) {
+  Write-Log ('浏览器任务: ' + $Action + ' ' + $Query + ' ' + $Url)
+  $py = Get-VoicePython
+  if (-not $py) { return @{ ok = $false; error = '语音 Python 环境未安装' } }
+  $tmp = Join-Path $script:DataDir 'tmp'
+  if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
+  $out = Join-Path $tmp 'browser.json'
+  Remove-Item $out -Force -ErrorAction SilentlyContinue
+
+  $args = @((Join-Path $script:AppDir 'voice\browser.py'), '--action', $Action, '--out', $out, '--limit', "$Limit", '--max-chars', "$MaxChars")
+  if ($Query) { $args += @('--query', $Query) }
+  if ($Url) { $args += @('--url', $Url) }
+
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $py
+  $psi.Arguments = (($args | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' ')
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.WorkingDirectory = $script:AppDir
+  try {
+    $proc = [System.Diagnostics.Process]::Start($psi)
+  } catch {
+    return @{ ok = $false; error = $_.Exception.Message }
+  }
+
+  $deadline = (Get-Date).AddSeconds(60)
+  $frame = New-Object System.Windows.Threading.DispatcherFrame
+  $timer = New-Object System.Windows.Threading.DispatcherTimer
+  $timer.Interval = [TimeSpan]::FromMilliseconds(150)
+  $timer.Add_Tick({
+    if ($proc.HasExited -or (Get-Date) -gt $deadline) {
+      $timer.Stop()
+      $frame.Continue = $false
+    }
+  })
+  $timer.Start()
+  [System.Windows.Threading.Dispatcher]::PushFrame($frame)
+  $timer.Stop()
+  if (-not $proc.HasExited) { try { $proc.Kill() } catch { } }
+  Start-Sleep -Milliseconds 120
+
+  if (-not (Test-Path $out)) { return @{ ok = $false; error = '浏览器任务没有输出' } }
+  try {
+    $obj = Get-Content $out -Raw -Encoding UTF8 | ConvertFrom-Json
+  } catch {
+    return @{ ok = $false; error = '浏览器结果解析失败' }
+  }
+  Remove-Item $out -Force -ErrorAction SilentlyContinue
+  return $obj
 }
 
 function Send-ChatMessage {

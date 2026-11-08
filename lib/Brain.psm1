@@ -130,6 +130,35 @@ function Get-ToolDefinitions {
     @{
       type     = 'function'
       function = @{
+        name        = 'browser_search'
+        description = '用无头浏览器搜索网页，返回标题/链接/摘要。用户问“搜一下/查一下/帮我查”并要你总结、念出来或回答事实问题时调用。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            query = @{ type = 'string'; description = '搜索关键词' }
+            limit = @{ type = 'integer'; description = '返回条数，默认 5' }
+          }
+          required   = @('query')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
+        name        = 'browser_read'
+        description = '用无头浏览器打开一个网址并读取正文，用于总结页面内容。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            url = @{ type = 'string'; description = '完整 http/https 网址' }
+          }
+          required   = @('url')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
         name        = 'open_app'
         description = '打开本机白名单里的应用或网站。用户说“打开浏览器/打开记事本/打开B站”时调用。'
         parameters  = @{
@@ -211,7 +240,8 @@ function Get-SystemPrompt {
   $parts += '工具规则：用户让你记待办/设提醒/记住事实时，先调用对应工具，再简短确认；不要假装已经记住。'
   $parts += '工作规则：凡是需要实际动手的任务（读写文件、跑命令、查代码、调研、多步骤操作），必须调用 delegate_to_dsh 交给本机 DSH 执行，不要自己假装完成，也不要只给建议；闲聊、情感陪伴、简单问答不要调用。调用后只回复「已经交给 DSH，完成后告诉你」，绝对不要声称任务已完成或编造结果——结果会在几秒后自动出现在聊天里。'
   $parts += '如果用户只是问怎么做、或者你不确定他是否真的要你动手，先调用 propose_dsh 问一句确认，不要直接执行。'
-  $parts += '要打开应用、网址或搜索时，调用 open_app / open_url / search_web；只能打开白名单里的应用，打不开就如实说，不要编造已经打开。'
+  $parts += '要打开应用、网址或搜索时，调用 open_app / open_url / search_web；只能打开白名单里的应用，打不开就如实说，不要编造已经打开。需要联网查资料、读网页、总结搜索结果时，调用 browser_search / browser_read，基于返回内容回答并尽量引用标题和链接，不要凭记忆编造。'
+  $parts += '硬性规则：用户只要说了「搜一下 / 查一下 / 帮我搜 / 网上查 / 搜搜看」，你必须先调用 browser_search，不许直接凭记忆回答；用户给了网址让你看，必须先调用 browser_read。基于搜索结果回答时，末尾附上 1–2 条来源链接（原样 URL）。'
   return ($parts -join "`r`n")
 }
 
