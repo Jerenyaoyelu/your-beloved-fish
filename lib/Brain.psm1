@@ -115,6 +115,21 @@ function Get-ToolDefinitions {
     @{
       type     = 'function'
       function = @{
+        name        = 'propose_dsh'
+        description = '当你不确定用户是想让你真的执行，还是只想问做法/建议时，先调用它征求确认；用户确认后，下一轮再调用 delegate_to_dsh。'
+        parameters  = @{
+          type       = 'object'
+          properties = @{
+            task     = @{ type = 'string'; description = '准备交给 DSH 的任务' }
+            question = @{ type = 'string'; description = '问用户的一句话，例如“要我直接在项目里改吗？”' }
+          }
+          required   = @('task')
+        }
+      }
+    },
+    @{
+      type     = 'function'
+      function = @{
         name        = 'delegate_to_dsh'
         description = '把需要实际执行的工作任务（读写文件、跑命令、查代码、调研、多步骤操作）交给本机 DSH 处理。闲聊、情感陪伴、简单问答不要调用。调用后任务在后台执行，结果会自动发到聊天；回复时只说已交给 DSH，不要声称已完成。'
         parameters  = @{
@@ -153,6 +168,7 @@ function Get-SystemPrompt {
   $parts += ''
   $parts += '工具规则：用户让你记待办/设提醒/记住事实时，先调用对应工具，再简短确认；不要假装已经记住。'
   $parts += '工作规则：凡是需要实际动手的任务（读写文件、跑命令、查代码、调研、多步骤操作），必须调用 delegate_to_dsh 交给本机 DSH 执行，不要自己假装完成，也不要只给建议；闲聊、情感陪伴、简单问答不要调用。调用后只回复「已经交给 DSH，完成后告诉你」，绝对不要声称任务已完成或编造结果——结果会在几秒后自动出现在聊天里。'
+  $parts += '如果用户只是问怎么做、或者你不确定他是否真的要你动手，先调用 propose_dsh 问一句确认，不要直接执行。'
   return ($parts -join "`r`n")
 }
 

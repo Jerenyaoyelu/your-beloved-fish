@@ -926,6 +926,8 @@ $script:BalanceWasLow = [bool]$script:Config.lastBalanceLow
 $script:PendingContext = ''
 $script:Synth = $null
 $script:DshRun = $null
+$script:DshSessionId = ''
+$script:PendingDshTask = ''
 $script:GifFrames = @()
 $script:GifIndex = 0
 $script:GifTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -1046,7 +1048,7 @@ function Show-Bubble([string]$Text, [string]$Sub = '') {
   $anim = New-Object System.Windows.Media.Animation.DoubleAnimation(0, 1, [TimeSpan]::FromMilliseconds(180))
   $script:BubbleHost.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
   $script:BubbleTimer.Stop()
-  $script:BubbleTimer.Start()
+  [void]$script:BubbleTimer.Start()
 }
 
 function Get-StatusLine {
@@ -1307,7 +1309,7 @@ function Speak-Reply([string]$Text) {
 }
 
 # ============================================================================
-#  交给 DSH（headless 桥）
+#  交给 DSH（持久会话 + 流式输出）
 # ============================================================================
 function Get-DshPaths {
   $root = [string]$script:Config.dshRoot
@@ -1315,6 +1317,75 @@ function Get-DshPaths {
   $exe = Join-Path $root 'DeepSeek Harness.exe'
   $cliJs = Join-Path $root 'resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js'
   return @{ exe = $exe; cliJs = $cliJs; ok = (Test-Path $exe) }
+}
+
+function Get-DshSessionFile { return (Join-Path $script:DataDir 'dsh-session.json') }
+
+function Load-DshSessionId {
+  $f = Get-DshSessionFile
+  if (Test-Path $f) {
+    try {
+      $o = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+      return [string]$o.id
+    } catch { }
+  }
+  return ''
+}
+
+function Save-DshSessionId([string]$Id) {
+  try {
+    @{ id = $Id; updated = (Get-Date).ToString('s') } | ConvertTo-Json | Set-Content (Get-DshSessionFile) -Encoding UTF8
+  } catch { }
+}
+
+function Clear-DshSession {
+  $script:DshSessionId = ''
+  $f = Get-DshSessionFile
+  if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+}
+
+function Update-DshLiveBubble($Run) {
+  if (-not $Run.bubble) {
+    $Run.bubble = Add-ChatBubble ([string]$Run.text) 'assistant'
+  } else {
+    $Run.bubble.Child.Text = [string]$Run.text
+    $script:ChatScroll.ScrollToEnd()
+  }
+}
+
+function Read-DshStream($Run) {
+  if (-not (Test-Path $Run.out)) { return }
+  try {
+    $all = [System.IO.File]::ReadAllText($Run.out, [System.Text.Encoding]::UTF8)
+  } catch { return }
+  if ($all.Length -le $Run.offset) { return }
+  $chunk = $all.Substring($Run.offset)
+  $Run.offset = $all.Length
+  $Run.buffer += $chunk
+  $parts = $Run.buffer -split "`n"
+  $Run.buffer = $parts[-1]
+  for ($i = 0; $i -lt $parts.Count - 1; $i++) {
+    $line = $parts[$i].Trim()
+    if (-not $line) { continue }
+    try { $ev = $line | ConvertFrom-Json } catch { continue }
+    switch ($ev.type) {
+      'session' {
+        $Run.sessionId = [string]$ev.sessionId
+        if ($Run.sessionId) { Save-DshSessionId $Run.sessionId }
+      }
+      'text' {
+        $Run.text += [string]$ev.text
+        Update-DshLiveBubble $Run
+      }
+      'final' {
+        $Run.final = [string]$ev.text
+        if ($ev.sessionId) {
+          $Run.sessionId = [string]$ev.sessionId
+          Save-DshSessionId $Run.sessionId
+        }
+      }
+    }
+  }
 }
 
 function Start-DshTask([string]$Task) {
@@ -1333,20 +1404,26 @@ function Start-DshTask([string]$Task) {
     return
   }
 
+  if (-not $script:DshSessionId) { $script:DshSessionId = Load-DshSessionId }
+  $usedSession = $script:DshSessionId
   $clean = $Task -replace '"', "'"
+
   $tmp = Join-Path $script:DataDir 'tmp'
   if (-not (Test-Path $tmp)) { New-Item -ItemType Directory -Path $tmp -Force | Out-Null }
   $stamp = (Get-Date).ToString('HHmmssfff')
   $outFile = Join-Path $tmp ("dsh-$stamp.out")
   $errFile = Join-Path $tmp ("dsh-$stamp.err")
 
+  $args = @('--expose-internals', ('"' + $paths.cliJs + '"'), 'headless', '--json')
+  if ($usedSession) { $args += @('--session-id', $usedSession) }
+  $args += ('"' + $clean + '"')
+
   $oldNode = $env:ELECTRON_RUN_AS_NODE
   $oldKey = $env:DEEPSEEK_API_KEY
   $env:ELECTRON_RUN_AS_NODE = '1'
   $env:DEEPSEEK_API_KEY = $key
   try {
-    $proc = Start-Process -FilePath $paths.exe `
-      -ArgumentList @('--expose-internals', ('"' + $paths.cliJs + '"'), 'headless', ('"' + $clean + '"')) `
+    $proc = Start-Process -FilePath $paths.exe -ArgumentList $args `
       -RedirectStandardOutput $outFile -RedirectStandardError $errFile `
       -WindowStyle Hidden -WorkingDirectory $script:WorkspaceDir -PassThru
   } catch {
@@ -1357,25 +1434,36 @@ function Start-DshTask([string]$Task) {
     $env:DEEPSEEK_API_KEY = $oldKey
   }
 
+  Show-Chat
+  Add-ChatBubble ('【交给 DSH】' + $Task) 'system' | Out-Null
+  Show-Bubble '交给 DSH 了…' $(if ($usedSession) { '接着上次的会话' } else { '新会话，第一次可能慢' })
+
   $script:DshRun = @{
-    proc    = $proc
-    out     = $outFile
-    err     = $errFile
-    task    = $Task
-    started = (Get-Date)
-    timeout = 240
+    proc       = $proc
+    out        = $outFile
+    err        = $errFile
+    task       = $Task
+    started    = (Get-Date)
+    timeout    = 240
+    offset     = 0
+    buffer     = ''
+    text       = ''
+    final      = ''
+    bubble     = $null
+    sessionId  = ''
+    usedSession = $usedSession
   }
-  Show-Bubble '交给 DSH 了…' '这类任务可能要十几秒'
-  $script:DshTimer.Start()
+  [void]$script:DshTimer.Start()
 }
 
 $script:DshTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:DshTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+$script:DshTimer.Interval = [TimeSpan]::FromMilliseconds(400)
 $script:DshTimer.Add_Tick({
   if (-not $script:DshRun) { $script:DshTimer.Stop(); return }
   $run = $script:DshRun
 
   if (-not $run.proc.HasExited) {
+    Read-DshStream $run
     if (((Get-Date) - $run.started).TotalSeconds -gt $run.timeout) {
       try { $run.proc.Kill() } catch { }
       $script:DshRun = $null
@@ -1386,29 +1474,24 @@ $script:DshTimer.Add_Tick({
   }
 
   $script:DshTimer.Stop()
-  Start-Sleep -Milliseconds 120
+  Start-Sleep -Milliseconds 150
+  Read-DshStream $run
   $stdout = ''
   $stderr = ''
   try { if (Test-Path $run.out) { $stdout = [System.IO.File]::ReadAllText($run.out, [System.Text.Encoding]::UTF8) } } catch { }
   try { if (Test-Path $run.err) { $stderr = [System.IO.File]::ReadAllText($run.err, [System.Text.Encoding]::UTF8) } } catch { }
   Remove-Item $run.out, $run.err -Force -ErrorAction SilentlyContinue
+
   $elapsed = [int]((Get-Date) - $run.started).TotalSeconds
   $code = $null
-  try {
-    $run.proc.Refresh()
-    $code = $run.proc.ExitCode
-  } catch { }
-  $task = $run.task
-  $script:DshRun = $null
-  $ok = ($code -eq 0) -or (($null -eq $code -or "$code" -eq '') -and -not [string]::IsNullOrWhiteSpace($stdout))
+  try { $run.proc.Refresh(); $code = $run.proc.ExitCode } catch { }
+  $text = if (-not [string]::IsNullOrWhiteSpace($run.final)) { $run.final } else { $run.text }
+  if ($text.Length -gt 4000) { $text = $text.Substring(0, 4000) + '…' }
 
-  Show-Chat
-  Add-ChatBubble ('【交给 DSH】' + $task) 'system' | Out-Null
-  if ($ok -and -not [string]::IsNullOrWhiteSpace($stdout)) {
-    $reply = $stdout.Trim()
-    if ($reply.Length -gt 3000) { $reply = $reply.Substring(0, 3000) + '…' }
-    Add-ChatBubble $reply 'assistant' | Out-Null
-    Speak-Reply $reply
+  if (-not [string]::IsNullOrWhiteSpace($text)) {
+    if ($run.bubble) { $run.bubble.Child.Text = $text }
+    else { Add-ChatBubble $text 'assistant' | Out-Null }
+    Speak-Reply $text
     Show-Bubble 'DSH 回来啦' ('用时 ' + $elapsed + ' 秒')
   } else {
     $msg = $stderr.Trim()
@@ -1416,9 +1499,13 @@ $script:DshTimer.Add_Tick({
     if ($msg.Length -gt 800) { $msg = $msg.Substring(0, 800) + '…' }
     Add-ChatBubble ('DSH 失败：' + $msg) 'system' | Out-Null
     Show-Bubble 'DSH 没跑成功' '详情在聊天窗口'
+    if ($run.usedSession) {
+      Clear-DshSession
+      Add-ChatBubble '（旧会话可能失效，已重置，下次会新建一个会话）' 'system' | Out-Null
+    }
   }
-  $codeText = if ($null -eq $code -or "$code" -eq '') { 'n/a' } else { $code }
-  Write-Log ('DSH 完成: code=' + $codeText + ' ' + $elapsed + 's')
+  $script:DshRun = $null
+  Write-Log ('DSH 完成: ' + $elapsed + 's session=' + $run.sessionId)
 })
 
 function Show-DshDialog {
@@ -1576,7 +1663,16 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
         foreach ($h in $hits) { $items += @{ kind = $h.kind; text = $h.text } }
         return (@{ ok = $true; hits = $items } | ConvertTo-Json -Depth 5 -Compress)
       }
+      'propose_dsh' {
+        $task = [string]$a['task']
+        $q = [string]$a['question']
+        if ([string]::IsNullOrWhiteSpace($q)) { $q = '要交给 DSH 真的去做吗？回「要」就开跑。' }
+        $script:PendingDshTask = $task
+        Show-Bubble '要交给 DSH 吗？' $q | Out-Null
+        return (@{ ok = $true; status = 'awaiting_user'; question = $q; note = '已向用户确认，等待回复；不要声称已执行' } | ConvertTo-Json -Compress)
+      }
       'delegate_to_dsh' {
+        $script:PendingDshTask = ''
         $task = [string]$a['task']
         if ([string]::IsNullOrWhiteSpace($task)) {
           return (@{ ok = $false; reason = '任务为空' } | ConvertTo-Json -Compress)
@@ -1584,7 +1680,7 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
         if ($script:DshRun) {
           return (@{ ok = $false; reason = 'DSH 正在处理上一个任务，稍后再试' } | ConvertTo-Json -Compress)
         }
-        Start-DshTask $task
+        Start-DshTask $task | Out-Null
         if ($script:DshRun) {
           return (@{ ok = $true; status = 'running'; task = $task; note = '后台执行中，结果会自动发到聊天；回复时只说已交给 DSH，不要声称已完成' } | ConvertTo-Json -Compress)
         }
@@ -1667,6 +1763,7 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   $ctx = $script:ChatCtx
   if (-not $ctx) { return }
   if ($Status -ne 200) {
+    Write-Log ('聊天错误 ' + $Status + ': ' + $Body)
     if ($Status -eq 402) { Notify-BalanceLow '这条消息没发出去：账户余额不足（402）' -Force }
     if ($Status -eq 401) { Show-Bubble 'API Key 失效了' '右键我 →「设置」重新填一下' }
     Remove-ChatPlaceholder
@@ -1685,7 +1782,10 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   }
 
   $msg = $obj.choices[0].message
-  $toolCalls = @($msg.tool_calls)
+  $toolCalls = @()
+  if ($msg.tool_calls) {
+    $toolCalls = @($msg.tool_calls | Where-Object { $_ -and $_.id -and $_.function -and $_.function.name })
+  }
 
   if ($toolCalls.Count -gt 0 -and $ctx.depth -lt 4) {
     $asst = @{ role = 'assistant'; content = ''; tool_calls = @() }
@@ -1761,6 +1861,30 @@ function Send-ChatMessage {
     Add-ChatBubble ('好，我让 DSH 去做：' + $task + '。好了告诉你。') 'assistant' | Out-Null
     Start-DshTask $task
     return
+  }
+
+  # 模糊的工作请求：先确认（不依赖模型判断）
+  if (-not $script:PendingDshTask -and $text -match '(改|修改|创建|新建|删除|删掉|运行|跑|执行|整理|安装|部署|修复|重构|读取|写入|查找|搜索|写).*(可以吗|能不能|要不要|好吗|行吗|是否|该不该)|(可以吗|能不能|要不要|好吗|行吗|是否|该不该).*(改|修改|创建|新建|删除|运行|跑|执行|整理|安装|部署|修复|重构|读取|写入|查找|搜索|写)') {
+    $script:PendingDshTask = $text
+    Show-Bubble '要交给 DSH 吗？' '回「要」就开始，回「不要」就算了' | Out-Null
+    Add-ChatBubble '这像是要动手的任务，要我交给 DSH 去做吗？回「要」就开始。' 'assistant' | Out-Null
+    return
+  }
+
+  # 待确认的 DSH 任务：用户回「要/不要」
+  if ($script:PendingDshTask) {
+    $pendingTask = $script:PendingDshTask
+    $script:PendingDshTask = ''
+    if ($text -match '^(要|好|可以|行|对|是的|嗯|麻烦|开跑|执行|go|yes)') {
+      if ($script:DshRun) { Add-ChatBubble 'DSH 还在处理上一个任务，等它跑完再说。' 'assistant' | Out-Null; return }
+      Add-ChatBubble '好，交给 DSH 了。' 'assistant' | Out-Null
+      Start-DshTask $pendingTask
+      return
+    }
+    if ($text -match '^(不要|不用|算了|取消|不|no)') {
+      Add-ChatBubble '好，那我不动它。' 'assistant' | Out-Null
+      return
+    }
   }
 
   $key = Get-ApiKey
@@ -2187,6 +2311,7 @@ $miSettings = New-MenuItem '设置…' { Show-Settings }
 $miSkin = New-MenuItem '换皮肤…' { Show-SkinPanel }
 $miLook = New-MenuItem '看看这个（读屏）' { Invoke-LookAtScreen }
 $miDsh = New-MenuItem '交给 DSH（备用）…' { Show-DshDialog }
+$miDshNew = New-MenuItem '开始新的 DSH 会话' { Clear-DshSession; Show-Bubble '好，下次重新开一个会话' }
 $miTts = New-MenuItem '朗读回复' {
   $script:Config.ttsEnabled = [bool]$miTts.IsChecked
   Save-Config
@@ -2200,6 +2325,7 @@ $miExit = New-MenuItem '退出' { Exit-App }
 $menu.Items.Add($miChat) | Out-Null
 $menu.Items.Add($miLook) | Out-Null
 $menu.Items.Add($miDsh) | Out-Null
+$menu.Items.Add($miDshNew) | Out-Null
 $menu.Items.Add($miMemory) | Out-Null
 $menu.Items.Add($miTodos) | Out-Null
 $menu.Items.Add($miReflect) | Out-Null
