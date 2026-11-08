@@ -87,6 +87,7 @@ function New-DefaultConfig {
     posY            = $null
     topmost         = $true
     autoStart       = $true
+    lowBalanceThreshold = 5
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
   }
@@ -505,6 +506,89 @@ $xamlMemory = @'
 '@
 
 # ============================================================================
+#  XAML — 错过的提醒
+# ============================================================================
+$xamlMissed = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="错过的提醒" Width="480" Height="430"
+        WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" FontFamily="Microsoft YaHei UI">
+  <Window.Resources>
+    <Style x:Key="PrimaryBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#2F7CF6" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#1E6BE6"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="GhostBtn" TargetType="Button">
+      <Setter Property="Foreground" Value="#5B6B7F"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bg" Background="#EEF3FA" CornerRadius="10" Padding="18,8">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bg" Property="Background" Value="#E3EBF5"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+
+  <Border CornerRadius="20" Background="#FFFDFB" BorderBrush="#E6EDF7"
+          BorderThickness="1" Margin="12">
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="30" ShadowDepth="5" Opacity="0.24" Color="#12203A"/>
+    </Border.Effect>
+    <Grid Margin="22,18,22,16">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+
+      <StackPanel Grid.Row="0">
+        <TextBlock Text="错过的提醒" FontSize="17" FontWeight="SemiBold" Foreground="#17202B"/>
+        <TextBlock x:Name="MissedSub" Text="" FontSize="12" Foreground="#7A8798"
+                   Margin="0,6,0,0" TextWrapping="Wrap"/>
+      </StackPanel>
+
+      <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,10,0,0">
+        <StackPanel x:Name="MissedList"/>
+      </ScrollViewer>
+
+      <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+        <Button x:Name="MissedLater" Content="稍后再说" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+        <Button x:Name="MissedIgnore" Content="忽略" Style="{StaticResource GhostBtn}" Margin="0,0,8,0"/>
+        <Button x:Name="MissedReplay" Content="补发" Style="{StaticResource PrimaryBtn}"/>
+      </StackPanel>
+    </Grid>
+  </Border>
+</Window>
+'@
+
+# ============================================================================
 #  XAML — 设置窗口
 # ============================================================================
 $xamlSettings = @'
@@ -634,6 +718,11 @@ $script:ChatCtx = $null
 $script:Extracting = $false
 $script:Reflecting = $false
 $script:MemBuilding = $false
+$script:ReviewingMissed = $false
+$script:MissedIds = @()
+$script:MissedPending = @()
+$script:BalanceWarned = $false
+$script:LastBalanceWarnAt = $null
 $script:IdleLines = @(
   '在呢在呢～', '摸摸头～', '今天也辛苦啦', '要不要聊两句？',
   '点我干嘛呀，嘿嘿', '我一直在这儿哦', '喝口水休息一下嘛', '嘿！'
@@ -688,6 +777,15 @@ $script:ChatClose = $script:ChatWindow.FindName('ChatClose')
 $script:ChatMemory = $script:ChatWindow.FindName('ChatMemory')
 $script:ChatBalance = $script:ChatWindow.FindName('ChatBalance')
 $script:ChatWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:ChatWindow })
+
+# ---------------------------------------------------------------- 错过提醒窗口
+$script:MissedWindow = New-WindowFromXaml $xamlMissed
+$script:MissedSub = $script:MissedWindow.FindName('MissedSub')
+$script:MissedList = $script:MissedWindow.FindName('MissedList')
+$script:MissedReplay = $script:MissedWindow.FindName('MissedReplay')
+$script:MissedIgnore = $script:MissedWindow.FindName('MissedIgnore')
+$script:MissedLater = $script:MissedWindow.FindName('MissedLater')
+$script:MissedWindow.Add_SourceInitialized({ Set-ToolWindowStyle $script:MissedWindow })
 
 # ---------------------------------------------------------------- 记忆窗口
 $script:MemWindow = New-WindowFromXaml $xamlMemory
@@ -872,6 +970,23 @@ function New-ApiRequest([string]$Method, [string]$Url, [string]$Key, [string]$Js
 # ============================================================================
 #  余额
 # ============================================================================
+function Notify-BalanceLow([string]$Detail = '', [switch]$Force) {
+  $now = Get-Date
+  if (-not $Force) {
+    if ($script:BalanceWarned) { return }
+  } else {
+    if ($script:LastBalanceWarnAt -and (($now - $script:LastBalanceWarnAt).TotalMinutes -lt 5)) { return }
+  }
+  $script:BalanceWarned = $true
+  $script:LastBalanceWarnAt = $now
+  $sub = if ($Detail) { $Detail } else { '去 platform.deepseek.com 充点值，我就能继续陪你' }
+  Show-Bubble '余额不足啦～' $sub
+  try {
+    if ($script:Tray) { $script:Tray.ShowBalloonTip(8000, '小鲸鱼：余额不足', $sub, [System.Windows.Forms.ToolTipIcon]::Warning) }
+  } catch { }
+  Write-Log ('余额提醒: ' + $sub)
+}
+
 function Refresh-Balance {
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) { $script:BalanceText = ''; Update-ChatBalance; return }
@@ -891,6 +1006,11 @@ function Refresh-Balance {
           $sym = if ($cur -eq 'USD') { '$' } else { '¥' }
           $script:BalanceText = '余额 ' + $sym + ([double]$info.total_balance).ToString('0.00')
           $script:BalanceOk = $true
+          $threshold = 5.0
+          try { if ($script:Config.lowBalanceThreshold) { $threshold = [double]$script:Config.lowBalanceThreshold } } catch { }
+          if ([double]$info.total_balance -lt $threshold) {
+            Notify-BalanceLow ('现在只剩 ' + $sym + ([double]$info.total_balance).ToString('0.00') + ' 了')
+          }
         } else {
           $script:BalanceText = ''
           $script:BalanceOk = $false
@@ -970,7 +1090,7 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
 function Get-ChatErrorText([int]$Status, [string]$Body) {
   switch ($Status) {
     401 { return 'API Key 不对哦（401）～ 右键小鲸鱼 →「设置」重新填一下。' }
-    402 { return '账户余额不足（402），去 platform.deepseek.com 充点再聊吧。' }
+    402 { return '账户余额不足（402），去 platform.deepseek.com 充点再聊吧（我已经在桌面提醒你了）。' }
     429 { return '请求太频繁了（429），歇一小会儿再试。' }
     -1 { return '连不上 DeepSeek 服务器，检查一下网络再试～' }
     default {
@@ -1005,6 +1125,8 @@ function Handle-ChatResponse([int]$Status, [string]$Body) {
   $ctx = $script:ChatCtx
   if (-not $ctx) { return }
   if ($Status -ne 200) {
+    if ($Status -eq 402) { Notify-BalanceLow '这条消息没发出去：账户余额不足（402）' -Force }
+    if ($Status -eq 401) { Show-Bubble 'API Key 失效了' '右键我 →「设置」重新填一下' }
     Remove-ChatPlaceholder
     Add-ChatBubble (Get-ChatErrorText $Status $Body) 'system' | Out-Null
     Set-ChatBusy $false
@@ -1133,6 +1255,7 @@ function Invoke-MemoryExtraction {
   Start-HttpTask $req {
     param($status, $body)
     $script:Extracting = $false
+    if ($status -eq 402) { Notify-BalanceLow '记忆自动整理因为余额不足暂停了' -Force }
     if ($status -ne 200) { return }
     try {
       $obj = $body | ConvertFrom-Json
@@ -1181,7 +1304,8 @@ function Invoke-Reflection {
     param($status, $body)
     $script:Reflecting = $false
     if ($status -ne 200) {
-      if ($script:MemWindow.IsVisible) { $script:MemStatus.Text = '整理失败（网络/Key）' }
+      if ($status -eq 402) { Notify-BalanceLow '每日整理因为余额不足暂停了' -Force }
+      if ($script:MemWindow.IsVisible) { $script:MemStatus.Text = '整理失败（网络/Key/余额）' }
       return
     }
     try {
@@ -1340,6 +1464,67 @@ $script:MemReflect.Add_Click({
 $script:MemWindow.Add_KeyDown({
   param($s, $e)
   if ($e.Key -eq 'Escape') { $script:MemWindow.Hide() }
+})
+
+function Show-MissedReminders {
+  $overdue = @(Get-DueReminders (Get-Date))
+  if ($overdue.Count -eq 0) { return }
+
+  $script:ReviewingMissed = $true
+  $script:MissedPending = $overdue
+  $script:MissedIds = @($overdue | ForEach-Object { $_.id })
+  $script:MissedList.Children.Clear()
+  $now = Get-Date
+  foreach ($r in $overdue) {
+    $at = [datetime]::Parse($r.at)
+    $late = $now - $at
+    $lateText = ''
+    if ($late.TotalDays -ge 1) { $lateText = ([int]$late.TotalDays).ToString() + ' 天前' }
+    elseif ($late.TotalHours -ge 1) { $lateText = ([int]$late.TotalHours).ToString() + ' 小时前' }
+    else { $lateText = ([Math]::Max(1, [int]$late.TotalMinutes)).ToString() + ' 分钟前' }
+
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = '⏰ ' + $at.ToString('MM-dd HH:mm') + '  ' + $r.text + '（' + $lateText + '到点）'
+    $tb.TextWrapping = 'Wrap'
+    $tb.FontSize = 12.5
+    $tb.Foreground = Get-Brush '#3F4B5B'
+    $tb.Margin = [System.Windows.Thickness]::new(0, 3, 0, 3)
+    [void]$script:MissedList.Children.Add($tb)
+  }
+  $script:MissedSub.Text = ('有 ' + $overdue.Count + ' 条提醒在你关机或不在时到点了，要现在补发吗？')
+  $script:MissedWindow.ShowDialog() | Out-Null
+  $script:ReviewingMissed = $false
+}
+
+$script:MissedReplay.Add_Click({
+  $items = @($script:MissedPending)
+  foreach ($r in $items) { Mark-ReminderFired $r.id }
+  $script:MissedPending = @()
+  $script:MissedWindow.Close()
+  if ($items.Count -eq 1) {
+    Show-Bubble ('⏰ ' + $items[0].text) '这条提醒之前错过了'
+  } elseif ($items.Count -gt 1) {
+    $lines = @()
+    foreach ($r in @($items | Select-Object -First 4)) { $lines += ('· ' + $r.text) }
+    Show-Bubble ('补发 ' + $items.Count + ' 条提醒') ($lines -join "`n")
+  }
+  try {
+    if ($script:Tray -and $items.Count -gt 0) {
+      $script:Tray.ShowBalloonTip(8000, '小鲸鱼：补发提醒', (($items | ForEach-Object { $_.text }) -join '；'), [System.Windows.Forms.ToolTipIcon]::Info)
+    }
+  } catch { }
+})
+
+$script:MissedIgnore.Add_Click({
+  foreach ($r in @($script:MissedPending)) { Mark-ReminderFired $r.id }
+  $script:MissedPending = @()
+  $script:MissedWindow.Close()
+})
+
+$script:MissedLater.Add_Click({ $script:MissedWindow.Close() })
+$script:MissedWindow.Add_KeyDown({
+  param($s, $e)
+  if ($e.Key -eq 'Escape') { $script:MissedWindow.Close() }
 })
 
 # ============================================================================
@@ -1596,8 +1781,10 @@ function Start-IdleAnimations {
 $script:ReminderTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:ReminderTimer.Interval = [TimeSpan]::FromSeconds(20)
 $script:ReminderTimer.Add_Tick({
+  if ($script:ReviewingMissed) { return }
   $due = Get-DueReminders (Get-Date)
   foreach ($r in $due) {
+    if ($script:MissedIds -contains $r.id) { continue }
     Mark-ReminderFired $r.id
     Show-Bubble ('⏰ ' + $r.text) '到点啦'
     try {
@@ -1625,6 +1812,7 @@ $script:MainWindow.Add_Loaded({
   $script:BalanceTimer.Start()
   $script:ReminderTimer.Start()
   Write-Log 'Loaded: timers started'
+  if (-not [string]::IsNullOrWhiteSpace((Get-ApiKey))) { Refresh-Balance }
 
   $stats = Get-MemoryStats
   if ($script:FreshMemory) {
@@ -1634,9 +1822,10 @@ $script:MainWindow.Add_Loaded({
   } elseif ([string]::IsNullOrWhiteSpace((Get-ApiKey))) {
     Show-Bubble '右键我 →「设置」' '填入 DeepSeek API Key，就能和我聊天啦'
   } else {
-    Refresh-Balance
     Show-Bubble '我回来啦～' (Get-StatusLine)
   }
+
+  Show-MissedReminders
 
   $meta = Get-Meta
   $today = (Get-Date).ToString('yyyy-MM-dd')
