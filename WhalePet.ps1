@@ -1576,6 +1576,20 @@ function Invoke-PetTool([string]$Name, [string]$ArgsJson) {
         foreach ($h in $hits) { $items += @{ kind = $h.kind; text = $h.text } }
         return (@{ ok = $true; hits = $items } | ConvertTo-Json -Depth 5 -Compress)
       }
+      'delegate_to_dsh' {
+        $task = [string]$a['task']
+        if ([string]::IsNullOrWhiteSpace($task)) {
+          return (@{ ok = $false; reason = '任务为空' } | ConvertTo-Json -Compress)
+        }
+        if ($script:DshRun) {
+          return (@{ ok = $false; reason = 'DSH 正在处理上一个任务，稍后再试' } | ConvertTo-Json -Compress)
+        }
+        Start-DshTask $task
+        if ($script:DshRun) {
+          return (@{ ok = $true; status = 'running'; task = $task; note = '后台执行中，结果会自动发到聊天；回复时只说已交给 DSH，不要声称已完成' } | ConvertTo-Json -Compress)
+        }
+        return (@{ ok = $false; reason = 'DSH 启动失败，检查安装路径和 API Key' } | ConvertTo-Json -Compress)
+      }
       'read_file' {
         $path = Resolve-WorkspacePath ([string]$a['path'])
         if (-not (Test-Path -LiteralPath $path)) {
@@ -1740,6 +1754,14 @@ function Send-ChatMessage {
   $script:ChatInput.Text = ''
   $script:ChatPlaceholder.Visibility = 'Visible'
   Add-ChatBubble $text 'user' | Out-Null
+
+  # 显式唤起：@dsh / dsh: / 交给 DSH / 让 DSH
+  if ($text -match '^(?:@dsh|dsh:|交给\s*dsh|让\s*dsh)\s*[:：]?\s*(.+)$') {
+    $task = $Matches[1].Trim()
+    Add-ChatBubble ('好，我让 DSH 去做：' + $task + '。好了告诉你。') 'assistant' | Out-Null
+    Start-DshTask $task
+    return
+  }
 
   $key = Get-ApiKey
   if ([string]::IsNullOrWhiteSpace($key)) {
@@ -2164,7 +2186,7 @@ $miAuto = New-MenuItem '开机自启' {
 $miSettings = New-MenuItem '设置…' { Show-Settings }
 $miSkin = New-MenuItem '换皮肤…' { Show-SkinPanel }
 $miLook = New-MenuItem '看看这个（读屏）' { Invoke-LookAtScreen }
-$miDsh = New-MenuItem '交给 DSH 处理…' { Show-DshDialog }
+$miDsh = New-MenuItem '交给 DSH（备用）…' { Show-DshDialog }
 $miTts = New-MenuItem '朗读回复' {
   $script:Config.ttsEnabled = [bool]$miTts.IsChecked
   Save-Config
