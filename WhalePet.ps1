@@ -69,6 +69,7 @@ trap {
 # ---------------------------------------------------------------- 模块
 Import-Module (Join-Path $script:AppDir 'lib\Store.psm1') -Force
 Import-Module (Join-Path $script:AppDir 'lib\Brain.psm1') -Force
+Import-Module (Join-Path $script:AppDir 'lib\Router.psm1') -Force
 Import-Module (Join-Path $script:AppDir 'lib\Skins.psm1') -Force
 
 $script:FreshMemory = -not (Test-Path (Join-Path $script:DataDir 'memory.json'))
@@ -101,6 +102,7 @@ function New-DefaultConfig {
     voiceWakeWord   = '小鲸鱼'
     voiceSilenceMs  = 1800
     dshRoot         = ''
+    dshAllowedDirs  = @()
     todayDate       = (Get-Date).ToString('yyyy-MM-dd')
     todayTokens     = 0
   }
@@ -1018,6 +1020,8 @@ $script:DshRun = $null
 $script:DshSessionId = ''
 $script:PendingDshTask = ''
 $script:PendingDshPermission = $null
+$script:PendingDshPlan = $null
+$script:WebContext = ''
 $script:VoiceProc = $null
 $script:VoiceOut = ''
 $script:VoiceListening = $false
@@ -1998,10 +2002,58 @@ function Read-DshStream($Run) {
   }
 }
 
-function Start-DshTask([string]$Task, [string]$ExtraDir = '') {
+function Get-TaskDirs([string]$Task) {
+  $dirs = New-Object System.Collections.Generic.List[string]
+  $map = [ordered]@{
+    '下载' = 'Downloads'; 'downloads' = 'Downloads'
+    '桌面' = 'Desktop'; 'desktop' = 'Desktop'
+    '文档' = 'Documents'; 'documents' = 'Documents'
+    '图片' = 'Pictures'; 'pictures' = 'Pictures'
+  }
+  foreach ($k in $map.Keys) {
+    if ($Task -match [regex]::Escape($k)) {
+      $p = Join-Path $env:USERPROFILE $map[$k]
+      if ((Test-Path $p) -and -not $dirs.Contains($p)) { $dirs.Add($p) }
+    }
+  }
+  foreach ($m in [regex]::Matches($Task, '[A-Za-z]:\\[^\s"''，。；、]+')) {
+    $p = $m.Value.TrimEnd('\')
+    if (Test-Path $p -PathType Leaf) { $p = Split-Path $p -Parent }
+    if ((Test-Path $p -PathType Container) -and -not $dirs.Contains($p)) { $dirs.Add($p) }
+  }
+  return @($dirs)
+}
+
+function Test-DshDirAllowed([string]$Dir) {
+  $full = [System.IO.Path]::GetFullPath($Dir).TrimEnd('\')
+  $ws = [System.IO.Path]::GetFullPath($script:WorkspaceDir).TrimEnd('\')
+  if ($full.Equals($ws, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($ws + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  foreach ($a in @($script:Config.dshAllowedDirs)) {
+    if ([string]::IsNullOrWhiteSpace([string]$a)) { continue }
+    $af = [System.IO.Path]::GetFullPath([string]$a).TrimEnd('\')
+    if ($full.Equals($af, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($af + '\', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+  }
+  return $false
+}
+
+function Start-DshTask([string]$Task, [string[]]$ExtraDirs = @(), [switch]$SkipPreflight) {
   $Task = ($Task -replace "`r?`n", ' ').Trim()
   if ([string]::IsNullOrWhiteSpace($Task)) { return }
   if ($script:DshRun) { Show-Bubble 'DSH 还在忙' '等这次跑完再发'; return }
+
+  if (-not $SkipPreflight) {
+    $need = @(Get-TaskDirs $Task)
+    $blocked = @($need | Where-Object { -not (Test-DshDirAllowed $_) })
+    if ($blocked.Count -gt 0) {
+      Write-Log ('DSH 预检需授权: ' + ($blocked -join ', '))
+      $script:PendingDshPlan = @{ task = $Task; dirs = $blocked }
+      Add-ChatBubble ('这个任务需要写入工作区外：' + ($blocked -join '、') + '。允许吗？回「要」=这次允许，「总是」=以后都允许，「不要」=取消。') 'assistant' | Out-Null
+      Show-Bubble '需要授权' ('允许写入 ' + ($blocked -join '、') + '？')
+      Set-ChatStatus ''
+      return
+    }
+    $ExtraDirs = @($need | Where-Object { (Test-DshDirAllowed $_) -and (-not ([System.IO.Path]::GetFullPath($_).TrimEnd('\').StartsWith([System.IO.Path]::GetFullPath($script:WorkspaceDir).TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase))) })
+  }
 
   $paths = Get-DshPaths
   if (-not $paths.ok) {
@@ -2027,7 +2079,9 @@ function Start-DshTask([string]$Task, [string]$ExtraDir = '') {
 
   $args = @('--expose-internals', ('"' + $paths.cliJs + '"'), 'headless', '--json')
   if ($usedSession) { $args += @('--session-id', $usedSession) }
-  if ($ExtraDir) { $args += @('--add-dir', ('"' + $ExtraDir + '"')) }
+  if ($ExtraDirs -and $ExtraDirs.Count -gt 0) {
+    foreach ($d in $ExtraDirs) { $args += @('--add-dir', ('"' + $d + '"')) }
+  }
   $args += ('"' + $clean + '"')
 
   $oldNode = $env:ELECTRON_RUN_AS_NODE
@@ -2685,6 +2739,79 @@ function Send-ChatMessage {
   $script:ChatPlaceholder.Visibility = 'Visible'
   Add-ChatBubble $text 'user' | Out-Null
 
+  # ---- 调度器：先判断谁执行 ----
+  $route = Resolve-Intent -Text $text -KnownNames (@($script:OpenAppMap.Keys) + @($script:OpenSiteMap.Keys))
+  Write-Log ('路由: ' + $route.kind + ' | ' + $route.reason)
+
+  switch ($route.kind) {
+    'dsh' {
+      Add-ChatBubble ('好，交给 DSH：' + $route.task) 'assistant' | Out-Null
+      Start-DshTask $route.task
+      return
+    }
+    'ambiguous' {
+      $script:PendingDshTask = $route.task
+      Show-Bubble '要交给 DSH 吗？' '回「要」就开始，回「不要」就算了'
+      Add-ChatBubble '这像是要动手的任务，要我交给 DSH 去做吗？回「要」就开始。' 'assistant' | Out-Null
+      return
+    }
+    'action_open' {
+      $quick = Try-QuickAction $text
+      if ($quick) {
+        Set-ChatStatus ''
+        Add-ChatBubble $quick.message 'assistant' | Out-Null
+        Speak-Reply $quick.message
+        if ($script:ConversationActive) {
+          Wait-Speech
+          if ($script:ConversationActive) { Start-VoiceInput -Conversation }
+        }
+        return
+      }
+    }
+    'action_search' {
+      $quick = Try-QuickAction $text
+      if ($quick) {
+        Set-ChatStatus ''
+        Add-ChatBubble $quick.message 'assistant' | Out-Null
+        Speak-Reply $quick.message
+        if ($script:ConversationActive) {
+          Wait-Speech
+          if ($script:ConversationActive) { Start-VoiceInput -Conversation }
+        }
+        return
+      }
+    }
+    'browser_search' {
+      Set-ChatStatus '🔎 正在查资料…'
+      $r = Invoke-BrowserTask 'search' $route.query '' 5
+      Set-ChatStatus ''
+      if ($r.ok) {
+        $lines = @('【联网搜索结果】关键词：' + $route.query)
+        foreach ($it in @($r.results)) {
+          $lines += ('- ' + $it.title + ' | ' + $it.url + ' | ' + $it.snippet)
+        }
+        $script:WebContext = ($lines -join "`n")
+      } else {
+        Add-ChatBubble ('查资料失败：' + [string]$r.error) 'assistant' | Out-Null
+        Speak-Reply '查资料失败了'
+        return
+      }
+    }
+    'browser_read' {
+      Set-ChatStatus '📄 正在读页面…'
+      $r = Invoke-BrowserTask 'read' '' $route.url 3 3500
+      Set-ChatStatus ''
+      if ($r.ok) {
+        $script:WebContext = ('【网页内容】' + $r.url + "`n标题：" + $r.title + "`n" + $r.text)
+      } else {
+        Add-ChatBubble ('读页面失败：' + [string]$r.error) 'assistant' | Out-Null
+        Speak-Reply '读页面失败了'
+        return
+      }
+    }
+    default { }
+  }
+
   # 显式唤起：@dsh / dsh: / 交给 DSH / 让 DSH
   if ($text -match '^(?:@dsh|dsh:|交给\s*dsh|让\s*dsh)\s*[:：]?\s*(.+)$') {
     $task = $Matches[1].Trim()
@@ -2693,13 +2820,44 @@ function Send-ChatMessage {
     return
   }
 
-  # DSH 沙箱拦截后的授权确认
+  # 开跑前的权限确认
+  if ($script:PendingDshPlan) {
+    $plan = $script:PendingDshPlan
+    if ($text -match '^(总是|以后都允许|都允许|永久允许|always)') {
+      $list = @($script:Config.dshAllowedDirs)
+      foreach ($d in $plan.dirs) { if ($list -notcontains $d) { $list += $d } }
+      $script:Config.dshAllowedDirs = $list
+      Save-Config
+      $script:PendingDshPlan = $null
+$script:WebContext = ''
+      Add-ChatBubble ('好，以后都允许写入：' + ($plan.dirs -join '、')) 'assistant' | Out-Null
+      Start-DshTask $plan.task $plan.dirs -SkipPreflight
+      return
+    }
+    if ($text -match '^(要|好|可以|允许|同意|行|yes|OK)[。！!]?$') {
+      $script:PendingDshPlan = $null
+$script:WebContext = ''
+      Add-ChatBubble ('好，允许这次写入：' + ($plan.dirs -join '、')) 'assistant' | Out-Null
+      Start-DshTask $plan.task $plan.dirs -SkipPreflight
+      return
+    }
+    if ($text -match '^(不要|不用|算了|取消|不|no)[。！!]?$') {
+      $script:PendingDshPlan = $null
+$script:WebContext = ''
+      Add-ChatBubble '好，那就不写那个目录。' 'assistant' | Out-Null
+      return
+    }
+    $script:PendingDshPlan = $null
+$script:WebContext = ''
+  }
+
+  # 兜底：DSH 跑到一半才发现沙箱拒绝
   if ($script:PendingDshPermission) {
     $perm = $script:PendingDshPermission
     if ($text -match '^(要|好|可以|允许|同意|行|yes|OK)[。！!]?$') {
       $script:PendingDshPermission = $null
       Add-ChatBubble ('好，允许写入 ' + $perm.dir + '，重试。') 'assistant' | Out-Null
-      Start-DshTask $perm.task $perm.dir
+      Start-DshTask $perm.task @($perm.dir) -SkipPreflight
       return
     }
     if ($text -match '^(不要|不用|算了|取消|不|no)[。！!]?$') {
@@ -2764,6 +2922,11 @@ function Send-ChatMessage {
     $messages += @{ role = $t.role; content = $t.content }
   }
   $messages += @{ role = 'user'; content = $text }
+
+  if ($script:WebContext) {
+    $messages += @{ role = 'system'; content = $script:WebContext }
+    $script:WebContext = ''
+  }
 
   $script:ChatCtx = @{ messages = $messages; depth = 0; key = $key; userText = $text }
   Request-ChatRound
@@ -3618,6 +3781,16 @@ $script:MainWindow.Add_Loaded({
       }
     })
     $script:AutoTimer.Start()
+  }
+  if ($env:WHALEPET_SEND_TEST2) {
+    $script:Test2Timer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:Test2Timer.Interval = [TimeSpan]::FromSeconds(8)
+    $script:Test2Timer.Add_Tick({
+      $script:Test2Timer.Stop()
+      $script:ChatInput.Text = $env:WHALEPET_SEND_TEST2
+      Send-ChatMessage
+    })
+    $script:Test2Timer.Start()
   }
 })
 
