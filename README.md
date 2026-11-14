@@ -1,4 +1,6 @@
-﻿# 小鲸鱼桌宠（Whale Pet）v0.2
+﻿# 小鲸鱼
+
+> 交接/开发说明见 [docs/HANDOFF.md](docs/HANDOFF.md)（架构、配置、已知坑、下一步任务）。桌宠（Whale Pet）v0.2
 
 <p align="center"><img src="assets/icon.png" width="140" alt="小鲸鱼"></p>
 
